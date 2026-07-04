@@ -157,19 +157,6 @@ WHERE name='constant';"
 
 Bump `generate_series(0, N-1)` for N tasks / N·1000 rps.
 
-## Maintainer: rebuild & publish the platform images
-
-Only needed when platform code changes (not for running a submission).
-
-```bash
-docker login ghcr.io -u agrawalx            # PAT with write:packages
-deploy-local/build-and-push-ghcr.sh         # build all from the working tree + push :demo
-```
-
-Then make each new package **public** at https://github.com/users/agrawalx/packages
-(package → Settings → Change visibility → Public). Manifests reference
-`ghcr.io/agrawalx/<service>:demo`.
-
 ## Teardown
 
 ```bash
