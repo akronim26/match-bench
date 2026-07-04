@@ -171,15 +171,6 @@ For deeper or alternative needs:
 - [DeepWiki](https://deepwiki.com/akronim26/match-bench) — community-generated; mostly correct but ~2–3 days behind on the latest benchmarking and bug-fix work
 - [Google Doc](https://docs.google.com/document/d/13tPoT2Bfk82HeOVpX94-9zFqoKTqFExBVFwyRXRliBk/edit?usp=sharing)
 
-## Demo Video
-
-TODO: Add link to the project demo video.
-
-Suggested target:
-
-- Product walkthrough
-- Benchmark run demo
-- Leaderboard and telemetry demo
 
 ## Design Notes
 
