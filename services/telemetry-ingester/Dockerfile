@@ -8,8 +8,13 @@ WORKDIR /app
 # rdkafka is built with the `cmake-build` feature (vendored librdkafka), so the
 # builder needs cmake + a C/C++ toolchain. librdkafka-dev/pkg-config are kept for
 # parity with the other Rust service images.
+#
+# clang + libclang-dev are for the `zstd` rdkafka feature (zstd-1 compression on
+# orders.*): it pulls zstd-sys, whose build script runs bindgen, which dlopens
+# libclang at build time. Without it the build dies with "Unable to find libclang"
+# — a host build hides this whenever the developer happens to have clang installed.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends cmake build-essential librdkafka-dev pkg-config \
+    && apt-get install -y --no-install-recommends cmake build-essential librdkafka-dev pkg-config clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # The whole Cargo workspace must be present for cargo to resolve it — copy every

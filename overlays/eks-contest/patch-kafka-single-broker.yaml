@@ -1,0 +1,46 @@
+# Kafka = 1 broker (decided 2026-08-02, validation phase — same shape as
+# local; the 2nd kafka node idles and 2-broker scaling is a later revisit).
+# The base statefulset carries the bench-tier 3-broker shape and left kafka-2
+# Pending forever on the first apply. RF=1 everywhere: re-runnable benchmark
+# data, no replication.
+#
+# Placement added 2026-08-03: terraform creates a DEDICATED kafka node group
+# (main.tf, `pool=kafka`) tainted `kafka=true:NoSchedule`, but nothing in the
+# tree tolerated it — so Kafka scheduled onto a general node and the m6i.xlarge
+# broker node ran nothing, while Kafka competed with Postgres/Timescale/the
+# validator for the same cores. That contention is exactly what the pool split
+# exists to prevent, and it would confound M3 (telemetry at ramp peak).
+# Must be set BEFORE the first apply: EBS PVCs are AZ-bound, so adding the
+# selector after `kafka-logs` binds on a general node can leave the pod
+# unschedulable in the kafka node's AZ — recoverable only by deleting the PVC,
+# which wipes every topic and forces a kafka-topic-init re-run (auto-create is
+# off, so without that re-run every publish silently goes nowhere).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: data
+spec:
+  replicas: 1
+  template:
+    spec:
+      nodeSelector:
+        pool: kafka
+      tolerations:
+        - key: kafka
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: kafka
+          env:
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "0@kafka-0.kafka.data.svc.cluster.local:9093"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_MIN_INSYNC_REPLICAS
+              value: "1"

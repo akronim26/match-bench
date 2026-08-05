@@ -1,0 +1,7 @@
+protocol: REST
+language: go
+build:
+  type: go
+  target: algo
+port: 8080
+team_name: correct-clob

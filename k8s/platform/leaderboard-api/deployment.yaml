@@ -11,7 +11,7 @@ metadata:
   name: leaderboard-api
   namespace: platform
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: leaderboard-api

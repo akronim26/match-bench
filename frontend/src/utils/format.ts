@@ -28,6 +28,18 @@ export function formatLatencyUs(value: number): string {
 }
 
 /**
+ * formatJitterUs formats a P-G jitter percentile (microseconds) for the
+ * leaderboard: one decimal place, em-dash for "no data" (null/undefined) or
+ * the zero-inversions convention shared with CorrectnessScoreEvent.
+ */
+export function formatJitterUs(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value) || value === 0) {
+    return "—";
+  }
+  return `${value.toFixed(1)} us`;
+}
+
+/**
  * formatNumber performs the module-specific operation described by its name.
  * It keeps inputs, side effects, and returned values within this module's contract.
  */

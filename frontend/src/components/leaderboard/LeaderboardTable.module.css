@@ -46,6 +46,9 @@
 .correctCol {
   width: 130px;
 }
+.jitterCol {
+  width: 96px;
+}
 .deltaCol {
   width: 52px;
 }

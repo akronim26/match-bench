@@ -124,7 +124,7 @@ func main() {
 	defer kafkaPub.Close()
 
 	group := envOr("KAFKA_BENCHMARK_STATUS_GROUP", "submission-api-benchmark-status")
-	benchStatusConsumer := consumer.NewBenchmarkStatusConsumer(kafkaBrokers, group, pgStore, log)
+	benchStatusConsumer := consumer.NewBenchmarkStatusConsumer(kafkaBrokers, group, pgStore, kafkaPub, log)
 	defer benchStatusConsumer.Close()
 	go benchStatusConsumer.Start(ctx)
 

@@ -52,7 +52,7 @@ func TestProducerIntegrationPublishesControllerTopics(t *testing.T) {
 		}},
 	}
 	workloadKey := sessionID + ":7"
-	if err := producer.PublishWorkloadSpec(context.Background(), []topics.WorkloadSpec{spec}); err != nil {
+	if err := producer.PublishWorkloadSpec(context.Background(), []topics.WorkloadSpec{spec}, []int{7}); err != nil {
 		t.Fatalf("publish workload: %v", err)
 	}
 	if err := producer.PublishBarrier(context.Background(), sessionID, 123456789); err != nil {
@@ -109,6 +109,7 @@ func TestConsumerIntegrationDispatchesBotReady(t *testing.T) {
 		strings.Join(brokers, ","),
 		"itest-controller-benchmark-unused-"+suffix,
 		"itest-controller-ready-"+suffix,
+		nil,
 		nil,
 		sessions,
 		slog.New(slog.NewTextHandler(os.Stderr, nil)),

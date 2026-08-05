@@ -5,9 +5,12 @@
 //! The comments in this file describe public structure and callable behavior.
 
 use std::collections::HashMap;
+
+/// Cap on how many resync events get their bytes logged per session.
+const MAX_RESYNC_SAMPLES: u32 = 24;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::capture::{Capture, Direction, FlowKey};
+use crate::capture::{Capture, Direction, FlowKey, Transport};
 use crate::matcher::{MatchedEvent, Matcher, DEFAULT_IDLE_NS};
 use crate::parse::{self, Classified, Frame};
 use crate::reassembly::Reassembler;
@@ -18,6 +21,40 @@ pub struct Pipeline {
     reassemblers: HashMap<(FlowKey, Direction), Reassembler>,
     matcher: Matcher,
     clock_offset_ns: u64,
+    /// Byte-stream losses. Every one of these discards bytes that may contain whole FIX
+    /// messages, and a request lost here leaves its responses unmatchable — which is how
+    /// an order ends up with no orders.acked record at all. They were previously computed
+    /// (PushStats.reset) and thrown away at the call site, so the only visible symptom was
+    /// orders that inexplicably looked unanswered.
+    pub hold_overflows: u64,
+    pub buffer_overflows: u64,
+    pub truncation_resets: u64,
+    pub resync_skipped_bytes: u64,
+    /// Resync points whose head byte looks like a `permessage-deflate` WebSocket frame
+    /// header (RSV1 set, otherwise legal). Compression is unsupported — the payload carries
+    /// no readable cl_ord_id — and without this counter such a submission simply goes
+    /// silent, which is indistinguishable from an engine that answered nothing.
+    ///
+    /// Counts resync ATTEMPTS, not frames: a compressed stream resyncs byte by byte, so
+    /// treat any nonzero value as "a contestant is sending compressed frames", not as a
+    /// message count.
+    pub ws_compressed_frames: u64,
+    /// Bytes written off because a hole in the TCP stream was declared permanently lost.
+    /// This is honest loss — the capture never saw those bytes — but bounded to the hole
+    /// itself rather than stalling the flow behind it.
+    pub stream_gap_bytes: u64,
+    pub retransmitted_bytes: u64,
+    /// Complete the funnel: FIX messages successfully FRAMED out of the byte stream, per
+    /// direction. Compared against orders sent, a shortfall on the request side is the
+    /// signature of requests never reaching the parser — which is what leaves an order
+    /// with no records at all, since both its responses then arrive unmatchable.
+    pub framed_requests: u64,
+    pub framed_responses: u64,
+    /// Framed but unusable: no ClOrdID could be extracted, so the message cannot join.
+    pub framed_no_clordid: u64,
+    /// How many resync events have already been sampled into the log. Bounded so a
+    /// pathological stream cannot turn diagnosis into a log flood.
+    resync_samples: u32,
 }
 
 impl Pipeline {
@@ -34,6 +71,17 @@ impl Pipeline {
             reassemblers: HashMap::new(),
             matcher: Matcher::new(),
             clock_offset_ns,
+            hold_overflows: 0,
+            buffer_overflows: 0,
+            truncation_resets: 0,
+            resync_skipped_bytes: 0,
+            ws_compressed_frames: 0,
+            stream_gap_bytes: 0,
+            retransmitted_bytes: 0,
+            framed_requests: 0,
+            framed_responses: 0,
+            framed_no_clordid: 0,
+            resync_samples: 0,
         }
     }
 
@@ -50,12 +98,24 @@ impl Pipeline {
         self.matcher.unmatched_responses
     }
 
+    /// evicted_idle counts requests dropped after the idle window that never got a
+    /// response — a real loss, unlike the routine eviction of completed orders.
+    pub fn evicted_idle(&self) -> u64 {
+        self.matcher.evicted_idle_unanswered
+    }
+
+    /// evicted_capacity counts requests dropped because the inflight map was full.
+    pub fn evicted_capacity(&self) -> u64 {
+        self.matcher.evicted_capacity
+    }
+
     /// process performs the module-specific operation described by its name.
     /// It keeps validation, side effects, and returned values within this module's contract.
     pub fn process(&mut self, cap: &Capture, out: &mut Vec<MatchedEvent>) {
         let ts = self.to_realtime(cap.timestamp_ns);
 
         let mut framed: Vec<(u64, u32, bool, parse::ParsedMessage)> = Vec::new();
+        let (mut framed_requests, mut framed_responses, mut framed_no_clordid) = (0u64, 0u64, 0u64);
         let truncated = cap.payload_len as usize > cap.payload.len();
         {
             let re = self
@@ -63,9 +123,25 @@ impl Pipeline {
                 .entry((cap.flow, cap.direction))
                 .or_default();
             if truncated {
+                self.truncation_resets = self.truncation_resets.saturating_add(1);
                 re.reset_for_truncation();
             } else {
-                let reordered = re.push(cap.tcp_seq, ts, cap.payload).reordered;
+                let stats = re.push(cap.tcp_seq, ts, cap.payload);
+                let reordered = stats.reordered;
+                if stats.hold_overflow {
+                    self.hold_overflows = self.hold_overflows.saturating_add(1);
+                }
+                if stats.buffer_overflow {
+                    self.buffer_overflows = self.buffer_overflows.saturating_add(1);
+                }
+                if stats.gap_skipped_bytes > 0 {
+                    self.stream_gap_bytes = self
+                        .stream_gap_bytes
+                        .saturating_add(stats.gap_skipped_bytes as u64);
+                }
+                self.retransmitted_bytes = self
+                    .retransmitted_bytes
+                    .saturating_add(stats.retransmitted_bytes as u64);
                 loop {
                     match parse::frame(cap.transport, cap.direction, re.available()) {
                         Frame::Message(n) => {
@@ -74,15 +150,56 @@ impl Pipeline {
                             let parsed =
                                 parse::parse(cap.transport, cap.direction, &re.available()[..n]);
                             re.consume(n);
+                            if cap.direction == Direction::Request {
+                                framed_requests += 1;
+                            } else {
+                                framed_responses += 1;
+                            }
+                            if parsed.clordid.is_empty() {
+                                framed_no_clordid += 1;
+                            }
                             framed.push((msg_ts, msg_seq, reordered, parsed));
                         }
                         Frame::Incomplete => break,
-                        Frame::Resync(skip) => re.consume(skip.max(1)),
+                        Frame::Resync(skip) => {
+                            // Unframeable bytes skipped to regain sync. Whatever was in
+                            // them is gone, so this is a loss path like the overflows.
+                            let n = skip.max(1);
+                            self.resync_skipped_bytes =
+                                self.resync_skipped_bytes.saturating_add(n as u64);
+                            if cap.transport == Transport::HttpWs
+                                && parse::ws_looks_compressed(cap.direction, re.available())
+                            {
+                                self.ws_compressed_frames =
+                                    self.ws_compressed_frames.saturating_add(1);
+                            }
+                            // Sample what is being thrown away. A clean mid-message
+                            // fragment means bytes went missing upstream; a malformed
+                            // frame means the renderer or framer has a shape bug. Reading
+                            // the code cannot distinguish those, and guessing has been
+                            // wrong repeatedly.
+                            if self.resync_samples < MAX_RESYNC_SAMPLES {
+                                self.resync_samples += 1;
+                                let avail = re.available();
+                                let head = &avail[..avail.len().min(96)];
+                                tracing::warn!(
+                                    direction = ?cap.direction,
+                                    skipped = n,
+                                    buffered = avail.len(),
+                                    sample = %String::from_utf8_lossy(head).replace('\u{1}', "|"),
+                                    "framer resync: discarding unframeable bytes"
+                                );
+                            }
+                            re.consume(n)
+                        }
                     }
                 }
             }
         }
 
+        self.framed_requests += framed_requests;
+        self.framed_responses += framed_responses;
+        self.framed_no_clordid += framed_no_clordid;
         for (msg_ts, msg_seq, reordered, p) in framed {
             match p.class {
                 Classified::Request => self.matcher.on_request(

@@ -1,0 +1,37 @@
+# Point the capture at the ECR ebpf-latency image (2026-08-03).
+#
+# The capture image is NOT a container image field anywhere in the tree — it is
+# the CAPTURE_IMAGE env var that sandbox-orchestrator stamps into every capture
+# Job it creates (captureJobSpec, slot.go). Kustomize's `images:` transformer
+# rewrites image fields ONLY, so the base value
+# (ghcr.io/agrawalx/ebpf-latency:demo) passed straight through to EKS and every
+# capture Job ran a stale public :demo binary — one built before ccf0f80
+# ("CAPTURE_CAP 1536 -> 9029, restore jumbo MTU", 2026-08-01). That is why the
+# capture logged `clamped 9001 -> 1500` on EKS despite DEFAULT_CLAMP_MTU being
+# 9001 in the source and nothing in the tree setting CAPTURE_CLAMP_MTU: the
+# 1500 was the OLD binary's compiled-in default, not an env var. The same stale
+# image also carries CAPTURE_CAP=1536, so it is a live suspect for the
+# `orders.acked = 0` open item too.
+#
+# Invisible on local k3s and in the e2e path because both inject the var
+# explicitly (up-dev.sh:210, e2e/02-bootstrap.sh:35, infra/Makefile:168). Only
+# `kubectl apply -k overlays/eks-contest` fell through to the base default.
+#
+# The tag below is a PLACEHOLDER. Do not maintain it by hand: the
+# `replacements:` block in kustomization.yaml overwrites the ":tag" segment
+# with the tag already stamped onto the sandbox-orchestrator image, so the
+# capture can never drift from the rest of the deploy. ECR repos are immutable
+# and push-images.sh tags by git sha, so every push produces a new tag.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-orchestrator
+  namespace: sandbox
+spec:
+  template:
+    spec:
+      containers:
+        - name: sandbox-orchestrator
+          env:
+            - name: CAPTURE_IMAGE
+              value: 885232248981.dkr.ecr.us-east-1.amazonaws.com/iicpc/ebpf-latency:PLACEHOLDER

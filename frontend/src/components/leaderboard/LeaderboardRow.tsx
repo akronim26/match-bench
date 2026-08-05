@@ -8,7 +8,7 @@
 import { useRouter } from "next/navigation";
 import { Badge } from "@/components/common/Badge";
 import { statusForEntry, type LeaderboardEntry } from "@/types/leaderboard";
-import { formatNumber, formatPct, shortId } from "@/utils/format";
+import { formatJitterUs, formatNumber, formatPct, shortId } from "@/utils/format";
 import { rankTone } from "@/utils/score";
 import styles from "./LeaderboardRow.module.css";
 
@@ -71,6 +71,7 @@ export function LeaderboardRow({ entry, isOwnRow, flash }: Props) {
           {formatPct(entry.total_correctness)}
         </div>
       </td>
+      <td className={styles.number}>{formatJitterUs(entry.jitter_p99_us)}</td>
       <td className={`${styles.number} ${styles.delta}`}>
         {entry.rank_delta > 0
           ? `+${entry.rank_delta}`

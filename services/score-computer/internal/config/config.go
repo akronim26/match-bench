@@ -23,7 +23,6 @@ type Config struct {
 	StatusGroup          string
 	CorrectnessGroup     string
 	Concurrency          int
-	LeaderboardKey       string
 	MetricsAddr          string
 }
 
@@ -39,7 +38,6 @@ func Load(log *slog.Logger) Config {
 		StatusGroup:          envOr("KAFKA_STATUS_GROUP", "score-computer"),
 		CorrectnessGroup:     envOr("KAFKA_CORRECTNESS_GROUP", "score-computer-correctness"),
 		Concurrency:          envInt("SCORER_CONCURRENCY", 4),
-		LeaderboardKey:       envOr("LEADERBOARD_KEY", "leaderboard:global"),
 		MetricsAddr:          envOr("METRICS_ADDR", "0.0.0.0:9090"),
 	}
 }

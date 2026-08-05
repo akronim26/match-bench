@@ -1,0 +1,89 @@
+# k8s/kustomization.yaml — the BASE: every committed manifest, environment-neutral.
+# Overlays (../overlays/local-k3s, ../overlays/eks-contest) patch images, sizing
+# per-tier env on top. Excluded: ebpf-latency/job-template.yaml (reference only,
+# has <SLOT_ID> placeholders), build/spawner/deployment.ecr.yaml (image variant —
+# the images transformer owns refs now), build/serviceaccount.yaml (redundant: the
+# same ServiceAccount is defined in build/rbac.yaml with its roles),
+# benchmark/telemetry-rollup (rollup lives as the 2nd document of
+# benchmark/telemetry-ingester/deployment.yaml), platform/auth-api/deployment.yaml
+# (auth is disabled platform-wide, decided 2026-08-02; the file is kept for a
+# future auth-enabled deployment).
+#
+# platform/auth-api/service.yaml IS included, deliberately, even though nothing
+# backs it (2026-08-03). The frontend's nginx templates its upstreams from env
+# (`${AUTH_API_HOST}:${AUTH_API_PORT}`, AUTH_API_HOST=auth-api) and nginx
+# resolves every upstream at CONFIG-PARSE time — an unresolvable name is a hard
+# `[emerg] host not found in upstream` and the container never starts, whether
+# or not any request ever reaches /api/auth/. A ClusterIP Service with no
+# endpoints still publishes a DNS record, which is all nginx needs. up-dev.sh
+# has always injected this Service imperatively (`auth-api-absent` selector);
+# the kustomize tree did not, so `kubectl apply -k overlays/eks-contest` left
+# the frontend in CrashLoopBackOff on EKS while local looked fine. Declaring it
+# here fixes both paths from one place. Re-enabling auth = adding the
+# Deployment back; this Service already selects `app: auth-api`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - benchmark/bot-fleet-controller/deployment.yaml
+  - benchmark/bot-fleet-controller/pdb.yaml
+  - benchmark/bot-fleet/deployment.yaml
+  - benchmark/bot-fleet/scaledobject.yaml
+  - benchmark/correctness-validator/deployment.yaml
+  - benchmark/correctness-validator/scaledobject.yaml
+  - benchmark/namespace.yaml
+  - benchmark/network-policy.yaml
+  - benchmark/score-computer/deployment.yaml
+  - benchmark/score-computer/network-policy.yaml
+  - benchmark/score-computer/service.yaml
+  - benchmark/telemetry-ingester/deployment.yaml
+  - build/namespace.yaml
+  - build/network-policy.yaml
+  - build/rbac.yaml
+  - build/spawner/deployment.yaml
+  - data/kafka/service.yaml
+  - data/kafka/statefulset.yaml
+  - data/kafka/topic-init-job.yaml
+  - data/minio/service.yaml
+  - data/minio/statefulset.yaml
+  - data/namespace.yaml
+  - data/network-policy.yaml
+  - data/postgres/service.yaml
+  - data/postgres/statefulset.yaml
+  - data/redis/service.yaml
+  - data/redis/statefulset.yaml
+  - data/timescaledb/service.yaml
+  - data/timescaledb/statefulset.yaml
+  - observability/grafana/dashboard-provider.yaml
+  - observability/grafana/dashboards-configmap.yaml
+  - observability/grafana/datasources.yaml
+  - observability/grafana/deployment.yaml
+  - observability/grafana/service.yaml
+  - observability/loki/configmap.yaml
+  - observability/loki/deployment.yaml
+  - observability/loki/pvc.yaml
+  - observability/loki/service.yaml
+  - observability/namespace.yaml
+  - observability/network-policy.yaml
+  - observability/prometheus/configmap.yaml
+  - observability/prometheus/deployment.yaml
+  - observability/prometheus/pvc.yaml
+  - observability/prometheus/rbac.yaml
+  - observability/prometheus/service.yaml
+  - platform/auth-api/service.yaml
+  - platform/frontend/deployment.yaml
+  - platform/frontend/network-policy.yaml
+  - platform/frontend/service.yaml
+  - platform/leaderboard-api/deployment.yaml
+  - platform/leaderboard-api/network-policy.yaml
+  - platform/leaderboard-api/service.yaml
+  - platform/namespace.yaml
+  - platform/network-policy.yaml
+  - platform/submission-api/deployment.yaml
+  - platform/submission-api/service.yaml
+  - sandbox/gro-disable-daemonset.yaml
+  - sandbox/namespace.yaml
+  - sandbox/network-policy.yaml
+  - sandbox/sandbox-orchestrator/deployment.yaml
+  - sandbox/sandbox-orchestrator/network-policy.yaml
+  - sandbox/sandbox-orchestrator/rbac.yaml
+  - sandbox/sandbox-orchestrator/service.yaml

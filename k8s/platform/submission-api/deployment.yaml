@@ -11,7 +11,7 @@ metadata:
   name: submission-api
   namespace: platform
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: submission-api
@@ -84,6 +84,27 @@ spec:
             # are never re-created after that.
             - name: SEED_SCENARIOS
               value: "constant"
+            # The identity an UNAUTHENTICATED submission is stamped with, used
+            # only when AUTH_REQUIRED=false and no bearer token is present
+            # (main.go:161 -> handler.OptionalContestant).
+            #
+            # Declared 2026-08-03 because the Go default and the frontend
+            # DISAGREE: the API falls back to "e2e-contestant" while the
+            # frontend's compiled-in default is "echo-contestant"
+            # (frontend/src/config/platform.ts:53, baked at `next build` via
+            # NEXT_PUBLIC_DEFAULT_CONTESTANT_ID — not runtime-configurable). With
+            # them mismatched, the UI filters "my submissions" against an id the
+            # API never writes, so every row renders as another contestant's.
+            #
+            # Observed on EKS: browser uploads landed as e2e-contestant while a
+            # token-bearing client was devuser, and POST /benchmark answered
+            # "submission not found" (owner-scoped 404, handler/submission.go:56)
+            # until the identities were made to match.
+            #
+            # Set to the frontend's value because the frontend's is the one that
+            # cannot be changed without rebuilding its image.
+            - name: DEFAULT_CONTESTANT_ID
+              value: "echo-contestant"
           livenessProbe:
             httpGet:
               path: /health

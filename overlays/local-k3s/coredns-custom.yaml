@@ -1,0 +1,21 @@
+# LOCAL-ONLY CoreDNS override for the IIT-R campus network: wildcard
+# *.*.iitr.ac.in answers poison pod DNS lookups (Alpine resolvers retry
+# NOERROR-with-no-answer as NXDOMAIN storms), so short-circuit them and pin the
+# campus forwarders. Captured from the live cluster 2026-08-02 — previously
+# applied by hand and committed nowhere. This file existing ONLY in the
+# local-k3s overlay is what guarantees it can never reach EKS.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  campus.server: |
+    iitr.ac.in:53 {
+        errors
+        template ANY ANY {
+            match "^.*\..*\.iitr\.ac\.in\.$"
+            rcode NXDOMAIN
+        }
+        forward . 192.168.108.121 192.168.108.122
+    }

@@ -45,7 +45,27 @@ async fn run() -> std::io::Result<()> {
     let listener = TcpListener::bind(&bind).await?;
     eprintln!("responding-drain listening on {bind}");
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        // accept() errors must NEVER be fatal (2026-08-03). This was `accept().await?`,
+        // which propagates out of run() -> block_on -> main and EXITS the process, taking
+        // the listener with it. Observed on EKS: 500 tasks connecting at once drove ~304k
+        // orders/s for 3 seconds, then the process vanished — the bot saw `connection
+        // refused`, error_rate went to 1.0 and delivered tps to 0, which reads like a
+        // platform ceiling but is entirely self-inflicted. ECONNABORTED (peer RSTs between
+        // SYN and accept) is routine during a connect storm; EMFILE/ENFILE mean fd
+        // pressure and need a brief backoff so the loop cannot spin hot. Per-connection
+        // errors were already isolated in the spawned task below — only this one leaked.
+        let (stream, _peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                eprintln!("accept error (continuing): {e}");
+                // EMFILE=24, ENFILE=23: the fd table is full, so retrying immediately
+                // just burns CPU until connections close.
+                if matches!(e.raw_os_error(), Some(24) | Some(23)) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                continue;
+            }
+        };
         tokio::spawn(async move {
             if let Err(e) = handle(stream).await {
                 eprintln!("connection error: {e}");

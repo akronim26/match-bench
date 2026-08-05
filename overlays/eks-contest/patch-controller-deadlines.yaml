@@ -1,0 +1,36 @@
+# EKS deploy deadline (2026-08-03). Base default is 60s, which is generous on
+# local k3s — every image is pre-imported into containerd and the single node
+# is always present, so a slot is ready in ~2s. On EKS a slot's pod must be
+# SCHEDULED (possibly waiting on a node that is still joining) and then pull
+# the contestant image from ECR for the FIRST time; measured here at ~40-60s,
+# i.e. right at the edge of the old budget — the run failed with "slot did not
+# become ready within 1m0s" while the algo container had in fact started
+# seconds earlier. Contest day is all cold pulls, so 300s.
+#
+# READY_DEADLINE (added 2026-08-03) is the OTHER half and was never declared
+# anywhere in the tree — it existed only as the 30s Go default
+# (bot-fleet-controller/main.go:198) with every harness overriding it to 120s
+# imperatively (deploy-bench/eks-up.sh:108, deploy-local/up-dev.sh:226). Both
+# carry the same rationale: 30s fails `ramp`, because a run-group's scenarios
+# dispatch sequentially onto one worker, so a later scenario's slot waits out
+# the earlier one before it can report ready.
+#
+# DEPLOY_DEADLINE covers "pod scheduled and image pulled"; READY_DEADLINE covers
+# "slot reports ready" AFTER that. They are not interchangeable, and leaving the
+# second at its default silently reintroduced a failure the first was raised to
+# fix.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bot-fleet-controller
+  namespace: benchmark
+spec:
+  template:
+    spec:
+      containers:
+        - name: bot-fleet-controller
+          env:
+            - name: DEPLOY_DEADLINE
+              value: 300s
+            - name: READY_DEADLINE
+              value: 120s

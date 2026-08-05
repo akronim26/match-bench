@@ -1,0 +1,144 @@
+# overlays/eks-contest — the contest-tier EKS environment
+# (docs/eks-contest-deployment.md).
+#   kubectl apply -k overlays/eks-contest
+# Owns: ECR image refs (tags stamped by infra/terraform-v2/push-images.sh —
+# IMMUTABLE tags, so "did this pod get my code" is answerable by construction),
+# contest sizing (ALGO 4CPU/8Gi), the Graviton 1-pod-per-node bot-worker shape,
+# and the full 4-scenario seed. NO CoreDNS hack here — it exists only in
+# overlays/local-k3s, structurally.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../k8s
+  - results-export-job.yaml
+
+# ECR account/region match infra/terraform-v2 tfvars. newTag is a placeholder
+# until the first push-images.sh run stamps a real immutable tag.
+images:
+  - name: ghcr.io/agrawalx/submission-api
+    newName: 885232248981.dkr.ecr.us-east-1.amazonaws.com/iicpc/submission-api
+    newTag: "26e34d6"
+  - name: ghcr.io/agrawalx/auth-api
+    newName: 885232248981.dkr.ecr.us-east-1.amazonaws.com/iicpc/auth-api
+    newTag: "26e34d6"
+  - name: ghcr.io/agrawalx/leaderboard-api
+    newName: 885232248981.dkr.ecr.us-east-1.amazonaws.com/iicpc/leaderboard-api
+    newTag: "26e34d6"
+  - name: ghcr.io/agrawalx/frontend
+    newName: 885232248981.dkr.ecr.us-east-1.amazonaws.com/iicpc/frontend
+    newTag: "26e34d6"
+  - name: ghcr.io/agrawalx/spawner
+    newName: 885232248981.dkr.ecr.us-east-1.amazonaws.com/iicpc/spawner
+    newTag: "26e34d6"
+  - name: ghcr.io/agrawalx/sandbox-orchestrator
+    newName: 885232248981.dkr.ecr.us-east-1.amazonaws.com/iicpc/sandbox-orchestrator
+    newTag: "26e34d6"
+  - name: ghcr.io/agrawalx/bot-fleet-controller
+    newName: 885232248981.dkr.ecr.us-east-1.amazonaws.com/iicpc/bot-fleet-controller
+    # carries the 180s slot HTTP timeout fix (client.go)
+    newTag: "26e34d6"
+  - name: ghcr.io/agrawalx/bot-fleet
+    # Multi-arch manifest list (amd64 + arm64) — the ONE dual-arch image;
+    # Graviton botworker nodes pull arm64 automatically.
+    newName: 885232248981.dkr.ecr.us-east-1.amazonaws.com/iicpc/bot-fleet
+    newTag: "26e34d6"
+  - name: ghcr.io/agrawalx/correctness-validator
+    newName: 885232248981.dkr.ecr.us-east-1.amazonaws.com/iicpc/correctness-validator
+    newTag: "26e34d6"
+  - name: ghcr.io/agrawalx/score-computer
+    newName: 885232248981.dkr.ecr.us-east-1.amazonaws.com/iicpc/score-computer
+    newTag: "26e34d6"
+  - name: ghcr.io/agrawalx/telemetry-ingester
+    newName: 885232248981.dkr.ecr.us-east-1.amazonaws.com/iicpc/telemetry-ingester
+    newTag: "26e34d6"
+
+patches:
+  - path: patch-orchestrator-nodepool.yaml
+    target:
+      kind: Deployment
+      name: sandbox-orchestrator
+      namespace: sandbox
+  - path: patch-orchestrator-algo.yaml
+    target:
+      kind: Deployment
+      name: sandbox-orchestrator
+      namespace: sandbox
+  - path: patch-orchestrator-capture-image.yaml
+    target:
+      kind: Deployment
+      name: sandbox-orchestrator
+      namespace: sandbox
+  - path: patch-botworker-arm.yaml
+    target:
+      kind: Deployment
+      name: bot-fleet-worker
+      namespace: benchmark
+  - path: patch-submission-api-seed.yaml
+    target:
+      kind: Deployment
+      name: submission-api
+      namespace: platform
+  - path: patch-controller-deadlines.yaml
+    target:
+      kind: Deployment
+      name: bot-fleet-controller
+      namespace: benchmark
+  - path: patch-spawner-ecr.yaml
+    target:
+      kind: Deployment
+      name: spawner
+      namespace: build
+  - path: patch-kafka-single-broker.yaml
+    target:
+      kind: StatefulSet
+      name: kafka
+      namespace: data
+
+# The capture image ships as an ENV VAR (CAPTURE_IMAGE on sandbox-orchestrator,
+# consumed by captureJobSpec), which the `images:` transformer above cannot
+# reach — see patch-orchestrator-capture-image.yaml for the bring-up this cost.
+# Rather than add a second thing for push-images.sh to stamp (which would drift
+# the day someone stamps one and not the other), copy the tag OUT of the
+# already-stamped sandbox-orchestrator image field. Only the ":tag" segment is
+# replaced, so the ECR repo path in the patch is preserved. One source of
+# truth: whatever tag the platform runs, the capture runs.
+replacements:
+  - source:
+      kind: Deployment
+      name: sandbox-orchestrator
+      namespace: sandbox
+      fieldPath: spec.template.spec.containers.[name=sandbox-orchestrator].image
+      options:
+        delimiter: ":"
+        index: 1
+    targets:
+      - select:
+          kind: Deployment
+          name: sandbox-orchestrator
+          namespace: sandbox
+        fieldPaths:
+          - spec.template.spec.containers.[name=sandbox-orchestrator].env.[name=CAPTURE_IMAGE].value
+        options:
+          delimiter: ":"
+          index: 1
+  # SPAWNER_IMAGE — same shape: the `fetch` initContainer of every build Job,
+  # carried as an env var. See patch-spawner-ecr.yaml.
+  - source:
+      kind: Deployment
+      name: spawner
+      namespace: build
+      fieldPath: spec.template.spec.containers.[name=spawner].image
+      options:
+        delimiter: ":"
+        index: 1
+    targets:
+      - select:
+          kind: Deployment
+          name: spawner
+          namespace: build
+        fieldPaths:
+          - spec.template.spec.containers.[name=spawner].env.[name=SPAWNER_IMAGE].value
+        options:
+          delimiter: ":"
+          index: 1

@@ -71,6 +71,9 @@ export function useSSE(
       source.addEventListener("update", (event) =>
         dispatch("update", (event as MessageEvent).data),
       );
+      source.addEventListener("live_metrics", (event) =>
+        dispatch("live_metrics", (event as MessageEvent).data),
+      );
       source.onerror = () => {
         statusRef.current?.("error");
         source?.close();

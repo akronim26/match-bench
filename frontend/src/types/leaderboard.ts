@@ -31,6 +31,7 @@ export interface LeaderboardEntry {
   disqualification_code?: string;
   rank_delta: number;
   computed_at_ns: number;
+  jitter_p99_us?: number;
 }
 
 /**
@@ -67,9 +68,22 @@ export interface LeaderboardUpdateEvent {
  * SSEEvent describes structured data exchanged by this module.
  * Keep this shape aligned with API and component expectations.
  */
+export interface LiveMetricsEvent {
+  contestant_id: string;
+  session_id: string;
+  wave_index: number;
+  p50_ns: number;
+  p99_ns: number;
+  p999_ns: number;
+  tps_1s: number;
+  error_rate: number;
+  updated_at_ns: number;
+}
+
 export type SSEEvent =
   | { type: "snapshot"; data: LeaderboardResponse }
-  | { type: "update"; data: LeaderboardUpdateEvent };
+  | { type: "update"; data: LeaderboardUpdateEvent }
+  | { type: "live_metrics"; data: LiveMetricsEvent };
 
 /**
  * statusForEntry performs the module-specific operation described by its name.

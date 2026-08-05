@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/iicpc/schemas/topics"
 	cerrs "github.com/iicpc/submission-api/internal/errors"
 	"gopkg.in/yaml.v3"
 )
@@ -20,7 +21,14 @@ import (
 const MaxZipBytes = 100 << 20      // 100 MB
 const maxRootConfigBytes = 1 << 20 // 1 MB per root config/build file after decompression
 
-var validProtocols = map[string]struct{}{"FIX": {}, "REST": {}, "WS": {}}
+// ProtocolAll is the sentinel a submission declares in benchmark.yaml to
+// offer all three transports (FIX + REST + WS) to the same contestant
+// simultaneously. See docs/tps-improvement-plan.md §7.3.
+const ProtocolAll = "ALL"
+
+// Protocol declarations are validated by topics.ParseProtocols: one protocol,
+// "ALL", or an ordered comma combo ("REST,WS"). Order is meaningful — the
+// first element is the primary protocol pass-1 correctness runs on.
 var validLanguages = map[string]struct{}{"cpp": {}, "rust": {}, "go": {}}
 
 // BuildSection groups the state and dependencies used by this package.
@@ -122,7 +130,7 @@ func ValidateSubmissionZip(r io.ReaderAt, size int64) (*BenchmarkConfig, error) 
 		return nil, cerrs.ErrNoSrcDir
 	}
 
-	if _, ok := validProtocols[cfg.Protocol]; !ok {
+	if _, err := topics.ParseProtocols(cfg.Protocol); err != nil {
 		return nil, cerrs.ErrInvalidProtocol
 	}
 	if _, ok := validLanguages[cfg.Language]; !ok {
@@ -131,9 +139,11 @@ func ValidateSubmissionZip(r io.ReaderAt, size int64) (*BenchmarkConfig, error) 
 	if cfg.Build.Target == "" {
 		return nil, cerrs.ErrMissingBuildTarget
 	}
-	if cfg.Port < 1024 || cfg.Port > 65535 {
-		return nil, cerrs.ErrInvalidPortRange
+	port, err := normalizePort(cfg)
+	if err != nil {
+		return nil, err
 	}
+	cfg.Port = port
 
 	if err := validateBuildTarget(&cfg, buildFileName, buildFileContent); err != nil {
 		return nil, err
@@ -156,6 +166,51 @@ func readLimitedRootFile(r io.Reader) ([]byte, error) {
 }
 
 var validBuildTargetName = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+
+// validatePortPolicy enforces the platform-mandated port table: FIX must
+// declare 9898, REST/WS must declare 8080. Ports are platform constants, not
+// contestant-chosen (docs/tps-improvement-plan.md §7.3). A submission
+// declaring ProtocolAll offers all protocols on their respective mandated
+// ports, so its declared port is not checked against a single value.
+// normalizePort resolves benchmark.yaml's OPTIONAL `port:` (decision
+// 2026-08-02): ports are platform-mandated per protocol (FIX=9898,
+// REST/WS=8080 — the eBPF capture filter hardcodes them, so they were never
+// contestant-choosable). Absent → derived from the PRIMARY (first-declared)
+// protocol. Present → still validated: a wrong value on a single-protocol
+// declaration means a confused contestant, better told loudly at upload than
+// debugged at run time.
+func normalizePort(cfg BenchmarkConfig) (int, error) {
+	if cfg.Port == 0 {
+		parts, err := topics.ParseProtocols(cfg.Protocol)
+		if err != nil {
+			return 0, cerrs.ErrInvalidProtocol
+		}
+		return int(topics.PortForProtocol(parts[0])), nil
+	}
+	if cfg.Port < 1024 || cfg.Port > 65535 {
+		return 0, cerrs.ErrInvalidPortRange
+	}
+	if err := validatePortPolicy(cfg.Protocol, cfg.Port); err != nil {
+		return 0, err
+	}
+	return cfg.Port, nil
+}
+
+func validatePortPolicy(protocol string, port int) error {
+	parts, err := topics.ParseProtocols(protocol)
+	if err != nil {
+		return cerrs.ErrInvalidProtocol
+	}
+	// Multi-protocol (ALL or any combo) serves each protocol on its own
+	// mandated port, so the single declared port is not checked.
+	if len(parts) > 1 {
+		return nil
+	}
+	if uint16(port) != topics.PortForProtocol(parts[0]) {
+		return cerrs.ErrPortProtocolMismatch
+	}
+	return nil
+}
 
 // validateBuildTarget performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.

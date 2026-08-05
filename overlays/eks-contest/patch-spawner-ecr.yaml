@@ -1,0 +1,44 @@
+# Spawner in ECR mode (first Kaniko run failed 401, 2026-08-03): the ECR code
+# path (ecr_aws.go — IRSA-minted push tokens) activates only via
+# REGISTRY_PROVIDER=ecr; without it the spawner used Harbor basic-auth
+# (anon/anon) against ECR. HARBOR_PROJECT must be iicpc/ to match the IAM
+# push policy (base says agrawalx, the old ghcr project). Do NOT set
+# HARBOR_PRODUCTION_ENDPOINT here: the base takes it from a secretKeyRef and a
+# strategic-merge `value:` on the same env name yields both fields, which the
+# API server rejects — silently killing the whole Deployment apply (2026-08-03).
+# create-secrets.sh already points that secret at the ECR registry. The SA IRSA
+# annotation is applied by terraform's enable_spawner_irsa or by hand:
+#   kubectl -n build annotate sa build-spawner \
+#     eks.amazonaws.com/role-arn=arn:aws:iam::885232248981:role/iicpc-contest-build-spawner --overwrite
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spawner
+  namespace: build
+spec:
+  template:
+    spec:
+      containers:
+        - name: spawner
+          env:
+            - name: REGISTRY_PROVIDER
+              value: ecr
+            - name: HARBOR_PROJECT
+              value: iicpc
+            # Same class of bug as CAPTURE_IMAGE (2026-08-03): SPAWNER_IMAGE is
+            # an env var, not an image field, so `images:` never rewrote it and
+            # the base ghcr.io/agrawalx/spawner:demo shipped to EKS. It is the
+            # `fetch` initContainer of EVERY build Job (spawner.go:528), so the
+            # build pipeline ran a stale public binary while the long-running
+            # spawner ran this push's code. Suspect for the Kaniko 401 above:
+            # in ECR mode the fetcher must SKIP writing Harbor creds into the
+            # mounted /kaniko/.docker (fetcherEnv, spawner.go:710) — a :demo
+            # binary predating that branch ignores REGISTRY_PROVIDER=ecr and
+            # clobbers the ECR config. Every other bring-up path already
+            # injected it (up-dev.sh:168, e2e/02-bootstrap.sh:80,
+            # deploy-bench/up-full.sh:63); only this overlay did not.
+            # Tag is a PLACEHOLDER — the `replacements:` block in
+            # kustomization.yaml rewrites the ":tag" segment from the stamped
+            # spawner image. Do not hand-maintain it.
+            - name: SPAWNER_IMAGE
+              value: 885232248981.dkr.ecr.us-east-1.amazonaws.com/iicpc/spawner:PLACEHOLDER

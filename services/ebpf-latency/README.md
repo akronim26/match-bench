@@ -44,7 +44,7 @@ The kernel stamps `CLOCK_MONOTONIC` (`bpf_ktime_get_ns`). Userspace samples a
   on the bot for a clean `t3`. The `TRUNCATED_CAPTURES` counter stays 0 when this
   is set. The loader runs this itself at attach time (best-effort).
 - The loader also clamps the capture interface MTU to `CAPTURE_CLAMP_MTU`
-  (default 1500, `0` disables) at attach time, via raw `SIOCGIFMTU`/`SIOCSIFMTU`
+  (default 9001 since `ccf0f80`, `0` disables) at attach time, via raw `SIOCGIFMTU`/`SIOCSIFMTU`
   ioctls (no iproute2 needed in the image). Offloads off only bounds segments by
   the MTU — on EKS the pod veth inherits the node ENI's 9001-byte jumbo MTU, so
   a single full-MTU segment would still exceed the kernel's 1536-byte
@@ -86,8 +86,9 @@ struct capture_record {
 - `ORDERS_ACKED_TOPIC` (default `orders.acked`)
 - `EBPF_NETNS_PATH`, `EBPF_XDP_INGRESS_PROGRAM`, `EBPF_TC_EGRESS_PROGRAM`,
   `EBPF_RINGBUF_MAP`, `EBPF_FLUSH_INTERVAL_MS`, `EBPF_BATCH_SIZE`
-- `CAPTURE_CLAMP_MTU` (default `1500`; `0` disables the attach-time MTU clamp;
-  valid range otherwise 68–65535)
+- `CAPTURE_CLAMP_MTU` (default `9001` — the EKS jumbo MTU, which fits one
+  `CAPTURE_CAP`-sized record since `ccf0f80`; `1500` is the rollback lever; `0`
+  disables the attach-time MTU clamp; valid range otherwise 68–65535)
 
 ## Tests
 

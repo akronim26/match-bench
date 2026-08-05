@@ -28,53 +28,27 @@ func TestKeyedWritersUseKeySensitiveBalancer(t *testing.T) {
 			t.Errorf("%s writer balancer = %T, want *kafka.Hash (key-sensitive)", name, w.Balancer)
 		}
 	}
-	if _, ok := p.workloadWriter.Balancer.(*workerIndexBalancer); !ok {
-		t.Errorf("workload writer balancer = %T, want *workerIndexBalancer (explicit per-worker partition)", p.workloadWriter.Balancer)
+	if _, ok := p.workloadWriter.Balancer.(*leasedPartitionBalancer); !ok {
+		t.Errorf("workload writer balancer = %T, want *leasedPartitionBalancer (explicit leased partition)", p.workloadWriter.Balancer)
 	}
 }
 
-// TestWorkerPartitionMapsIndexModuloPartitions performs the package-specific operation described by its name.
+// TestLeasedPartitionBalancerRoutesToLeasedPartition performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func TestWorkerPartitionMapsIndexModuloPartitions(t *testing.T) {
-	tests := []struct {
-		name          string
-		workerIndex   uint32
-		numPartitions int
-		want          int
-	}{
-		{"index 0 pins partition 0", 0, 24, 0},
-		{"index 7 pins partition 7", 7, 24, 7},
-		{"index 23 pins last partition", 23, 24, 23},
-		{"index wraps modulo partition count", 24, 24, 0},
-		{"index 30 wraps to partition 6", 30, 24, 6},
-		{"zero partitions clamps to 0", 5, 0, 0},
-		{"negative partitions clamps to 0", 5, -1, 0},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := workerPartition(tt.workerIndex, tt.numPartitions); got != tt.want {
-				t.Errorf("workerPartition(%d, %d) = %d, want %d", tt.workerIndex, tt.numPartitions, got, tt.want)
-			}
-		})
-	}
-}
-
-// TestWorkerIndexBalancerRoutesByHint performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func TestWorkerIndexBalancerRoutesByHint(t *testing.T) {
-	b := &workerIndexBalancer{}
+func TestLeasedPartitionBalancerRoutesToLeasedPartition(t *testing.T) {
+	b := &leasedPartitionBalancer{}
 	parts := make([]int, 24)
 	for i := range parts {
 		parts[i] = i
 	}
 
-	for i := uint32(0); i < 24; i++ {
+	for i := 0; i < 24; i++ {
 		msg := kafka.Message{
 			Key:        []byte(fmt.Sprintf("sess-1:%d", i)),
 			WriterData: i,
 		}
-		if got := b.Balance(msg, parts...); got != int(i) {
-			t.Errorf("Balance(worker_index=%d) = partition %d, want %d", i, got, i)
+		if got := b.Balance(msg, parts...); got != i {
+			t.Errorf("Balance(leased=%d) = partition %d, want %d", i, got, i)
 		}
 	}
 
@@ -86,17 +60,27 @@ func TestWorkerIndexBalancerRoutesByHint(t *testing.T) {
 	if first < 0 || first >= len(parts) {
 		t.Errorf("fallback partition %d out of range [0,%d)", first, len(parts))
 	}
+
+	// A leased partition missing from the metadata view must be returned
+	// as-is, NOT hash-rerouted: the lease is the routing authority, and a
+	// genuinely nonexistent partition should fail the write loudly rather
+	// than silently landing on another session's leased partition.
+	staleView := kafka.Message{Key: []byte("sess-1:9"), WriterData: 99}
+	if got := b.Balance(staleView, parts...); got != 99 {
+		t.Errorf("stale-metadata Balance = %d, want the leased partition 99 (loud failure over silent reroute)", got)
+	}
 }
 
-// TestBuildWorkloadMessagesCarriesWorkerIndexHint performs the package-specific operation described by its name.
+// TestBuildWorkloadMessagesCarriesLeasedPartition performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func TestBuildWorkloadMessagesCarriesWorkerIndexHint(t *testing.T) {
+func TestBuildWorkloadMessagesCarriesLeasedPartition(t *testing.T) {
 	specs := []topics.WorkloadSpec{
 		{SessionID: "sess-1", WorkerIndex: 0, WorkerCount: 3},
 		{SessionID: "sess-1", WorkerIndex: 1, WorkerCount: 3},
 		{SessionID: "sess-1", WorkerIndex: 2, WorkerCount: 3},
 	}
-	msgs, err := buildWorkloadMessages(specs)
+	leases := []int{11, 12, 13}
+	msgs, err := buildWorkloadMessages(specs, leases)
 	if err != nil {
 		t.Fatalf("buildWorkloadMessages: %v", err)
 	}
@@ -108,38 +92,24 @@ func TestBuildWorkloadMessagesCarriesWorkerIndexHint(t *testing.T) {
 		if string(msg.Key) != wantKey {
 			t.Errorf("message %d key = %q, want %q", i, msg.Key, wantKey)
 		}
-		hint, ok := msg.WriterData.(uint32)
+		hint, ok := msg.WriterData.(int)
 		if !ok {
-			t.Fatalf("message %d WriterData = %T, want uint32 worker index", i, msg.WriterData)
+			t.Fatalf("message %d WriterData = %T, want int leased partition", i, msg.WriterData)
 		}
-		if hint != uint32(i) {
-			t.Errorf("message %d WriterData = %d, want %d", i, hint, i)
+		if hint != leases[i] {
+			t.Errorf("message %d WriterData = %d, want %d", i, hint, leases[i])
 		}
 	}
 }
 
-// TestValidateWorkerCapacity performs the package-specific operation described by its name.
+// TestBuildWorkloadMessagesRejectsLeaseMismatch performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func TestValidateWorkerCapacity(t *testing.T) {
-	tests := []struct {
-		name        string
-		workerCount int
-		partitions  int
-		wantErr     bool
-	}{
-		{"one worker one partition", 1, 1, false},
-		{"workers below partition count", 5, 24, false},
-		{"workers equal partition count", 24, 24, false},
-		{"workers exceed partition count", 25, 24, true},
-		{"no partitions reported", 1, 0, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateWorkerCapacity(tt.workerCount, tt.partitions)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("validateWorkerCapacity(%d, %d) error = %v, wantErr %v", tt.workerCount, tt.partitions, err, tt.wantErr)
-			}
-		})
+func TestBuildWorkloadMessagesRejectsLeaseMismatch(t *testing.T) {
+	specs := []topics.WorkloadSpec{{SessionID: "sess-1", WorkerIndex: 0}}
+	p := NewProducer("localhost:9092", slog.Default())
+	t.Cleanup(func() { _ = p.Close() })
+	if err := p.PublishWorkloadSpec(nil, specs, []int{1, 2}); err == nil { //nolint:staticcheck // noop producer, ctx unused
+		t.Fatal("expected error when lease count does not match spec count")
 	}
 }
 

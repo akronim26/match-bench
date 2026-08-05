@@ -9,9 +9,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/iicpc/schemas/topics"
 	cerrs "github.com/iicpc/sandbox-orchestrator/internal/errors"
 	"github.com/iicpc/sandbox-orchestrator/internal/store"
 	batchv1 "k8s.io/api/batch/v1"
@@ -34,7 +37,13 @@ const (
 
 	CaptureAppValue             = "ebpf-capture"
 	captureContestantAnnotation = "iicpc.dev/contestant-id"
-	captureObjectPath           = "/opt/iicpc/ebpf/libiicpc_ebpf_latency.so"
+	// captureOrderBandAnnotation carries the slot's leased order band from
+	// CreateSlot time (pod creation) through to ensureCapture, which runs
+	// later during Refresh once the pod is Ready and creates the capture
+	// Job — mirroring how captureContestantAnnotation threads contestantID
+	// across that same gap.
+	captureOrderBandAnnotation = "iicpc.dev/order-band"
+	captureObjectPath          = "/opt/iicpc/ebpf/libiicpc_ebpf_latency.so"
 
 	slotActiveDeadlineSeconds       = int64(3600)
 	captureJobActiveDeadlineSeconds = int64(3600)
@@ -136,16 +145,21 @@ func validateConfig(cfg Config) error {
 
 // CreateSlot applies behavior for its receiver performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func (m *Manager) CreateSlot(ctx context.Context, slotID, contestantID, image string, port int) error {
+func (m *Manager) CreateSlot(ctx context.Context, slotID, contestantID, image string, ports []int, orderBand uint32) error {
+	if len(ports) == 0 {
+		return fmt.Errorf("%w: at least one port is required", cerrs.ErrInvalidRequest)
+	}
 	if m.captureEnabled {
-		if _, ok := capturablePorts[port]; !ok {
-			return fmt.Errorf("%w: port %d is not in the eBPF-capture set {8080, 9898}", cerrs.ErrInvalidRequest, port)
+		for _, port := range ports {
+			if _, ok := capturablePorts[port]; !ok {
+				return fmt.Errorf("%w: port %d is not in the eBPF-capture set {8080, 9898}", cerrs.ErrInvalidRequest, port)
+			}
 		}
 	}
 
 	resourceName := podName(slotID)
 
-	existing, err := m.ensurePod(ctx, resourceName, slotID, contestantID, image, port)
+	existing, err := m.ensurePod(ctx, resourceName, slotID, contestantID, image, ports, orderBand)
 	if err != nil {
 		return err
 	}
@@ -161,7 +175,7 @@ func (m *Manager) CreateSlot(ctx context.Context, slotID, contestantID, image st
 		if !apierrors.IsNotFound(err) {
 			return fmt.Errorf("get service: %w", err)
 		}
-		if _, err := m.client.CoreV1().Services(m.namespace).Create(ctx, m.serviceSpec(slotID, port), metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		if _, err := m.client.CoreV1().Services(m.namespace).Create(ctx, m.serviceSpec(slotID, ports), metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create service: %w", err)
 		}
 	}
@@ -171,13 +185,13 @@ func (m *Manager) CreateSlot(ctx context.Context, slotID, contestantID, image st
 
 // ensurePod applies behavior for its receiver performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func (m *Manager) ensurePod(ctx context.Context, resourceName, slotID, contestantID, image string, port int) (*corev1.Pod, error) {
+func (m *Manager) ensurePod(ctx context.Context, resourceName, slotID, contestantID, image string, ports []int, orderBand uint32) (*corev1.Pod, error) {
 	existing, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, resourceName, metav1.GetOptions{})
 	switch {
 	case err == nil:
 		return existing, nil
 	case apierrors.IsNotFound(err):
-		created, err := m.client.CoreV1().Pods(m.namespace).Create(ctx, m.podSpec(slotID, contestantID, image, port), metav1.CreateOptions{})
+		created, err := m.client.CoreV1().Pods(m.namespace).Create(ctx, m.podSpec(slotID, contestantID, image, ports, orderBand), metav1.CreateOptions{})
 		if err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				existing, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, resourceName, metav1.GetOptions{})
@@ -225,12 +239,54 @@ func (m *Manager) Refresh(ctx context.Context, slotID string) (store.SlotState, 
 		return "", "", fmt.Errorf("get pod: %w", err)
 	}
 	state, msg := deriveState(pod)
-	if state == store.StateReady && m.captureEnabled {
-		if err := m.ensureCapture(ctx, pod); err != nil {
-			slog.Default().Warn("ensure capture job", "slot_id", slotID, "error", err)
+	if state == store.StateReady {
+		// QoL-7: the k8s readinessProbe only gates the primary port
+		// (ContainerPort[0]) — a contestant that binds one declared port but
+		// not the others would otherwise pass PodReady and fail mid-run
+		// instead of at WaitForReady. TCP-dial every remaining declared port
+		// before reporting the slot ready.
+		if ports := containerPorts(pod); len(ports) > 1 {
+			if ready, waitMsg := dialAllPorts(pod.Status.PodIP, ports[1:]); !ready {
+				return store.StateCreating, waitMsg, nil
+			}
+		}
+		if m.captureEnabled {
+			if err := m.ensureCapture(ctx, pod); err != nil {
+				slog.Default().Warn("ensure capture job", "slot_id", slotID, "error", err)
+			}
 		}
 	}
 	return state, msg, nil
+}
+
+// containerPorts extracts every declared container port from a pod's first
+// container, in declaration order.
+func containerPorts(pod *corev1.Pod) []int {
+	if len(pod.Spec.Containers) == 0 {
+		return nil
+	}
+	ports := make([]int, 0, len(pod.Spec.Containers[0].Ports))
+	for _, p := range pod.Spec.Containers[0].Ports {
+		ports = append(ports, int(p.ContainerPort))
+	}
+	return ports
+}
+
+// dialAllPorts TCP-dials every given port on the pod IP with a short
+// timeout, used to gate readiness on ports beyond the one covered by the
+// native k8s readinessProbe (QoL-7).
+func dialAllPorts(podIP string, ports []int) (bool, string) {
+	if podIP == "" {
+		return false, "pod scheduling / readiness probe pending"
+	}
+	for _, port := range ports {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", podIP, port), 300*time.Millisecond)
+		if err != nil {
+			return false, fmt.Sprintf("waiting for port %d to accept connections", port)
+		}
+		conn.Close()
+	}
+	return true, ""
 }
 
 // ListExisting applies behavior for its receiver performs the package-specific operation described by its name.
@@ -251,18 +307,20 @@ func (m *Manager) ListExisting(ctx context.Context) ([]store.Slot, int, error) {
 			continue
 		}
 		image := ""
-		port := 0
 		if len(pod.Spec.Containers) > 0 {
 			image = pod.Spec.Containers[0].Image
-			if len(pod.Spec.Containers[0].Ports) > 0 {
-				port = int(pod.Spec.Containers[0].Ports[0].ContainerPort)
-			}
+		}
+		ports := containerPorts(&pod)
+		port := 0
+		if len(ports) > 0 {
+			port = ports[0]
 		}
 		state, msg := deriveState(&pod)
 		out = append(out, store.Slot{
 			SlotID:    slotID,
 			Image:     image,
 			Port:      port,
+			Ports:     ports,
 			State:     state,
 			Message:   msg,
 			Endpoint:  store.Endpoint{Host: ServiceFQDN(slotID, m.namespace), Port: port},
@@ -315,7 +373,7 @@ func ServiceFQDN(slotID, namespace string) string {
 
 // podSpec applies behavior for its receiver performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func (m *Manager) podSpec(slotID, contestantID, image string, port int) *corev1.Pod {
+func (m *Manager) podSpec(slotID, contestantID, image string, ports []int, orderBand uint32) *corev1.Pod {
 	labels := map[string]string{
 		LabelApp:       AppValue,
 		LabelSlot:      slotID,
@@ -332,6 +390,11 @@ func (m *Manager) podSpec(slotID, contestantID, image string, port int) *corev1.
 	if contestantID != "" {
 		annotations[captureContestantAnnotation] = contestantID
 	}
+	// Always stamped (even when unset) so ensureCapture can tell "explicitly
+	// unassigned" apart from "annotation missing" — both currently mean
+	// "fall back to hash-derived banding", but recording it explicitly keeps
+	// the pod's annotation set self-describing for debugging.
+	annotations[captureOrderBandAnnotation] = strconv.FormatUint(uint64(orderBand), 10)
 
 	autoMount := false
 	readOnlyRoot := true
@@ -354,10 +417,15 @@ func (m *Manager) podSpec(slotID, contestantID, image string, port int) *corev1.
 				Name:            "algo",
 				Image:           image,
 				ImagePullPolicy: corev1.PullIfNotPresent,
-				Ports:           []corev1.ContainerPort{{ContainerPort: int32(port), Protocol: corev1.ProtocolTCP}},
+				Ports:           containerPortSpecs(ports),
+				// The k8s readinessProbe only supports one probe per
+				// container; it gates the primary (first declared) port.
+				// Remaining ports are gated in Refresh via a direct TCP
+				// dial (QoL-7) so a contestant binding only some declared
+				// ports fails WaitForReady instead of mid-run.
 				ReadinessProbe: &corev1.Probe{
 					ProbeHandler: corev1.ProbeHandler{
-						TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(port)},
+						TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(ports[0])},
 					},
 					InitialDelaySeconds: 1,
 					PeriodSeconds:       1,
@@ -399,6 +467,15 @@ func (m *Manager) podSpec(slotID, contestantID, image string, port int) *corev1.
 	return pod
 }
 
+// containerPortSpecs builds one corev1.ContainerPort per declared port.
+func containerPortSpecs(ports []int) []corev1.ContainerPort {
+	specs := make([]corev1.ContainerPort, len(ports))
+	for i, p := range ports {
+		specs[i] = corev1.ContainerPort{ContainerPort: int32(p), Protocol: corev1.ProtocolTCP}
+	}
+	return specs
+}
+
 // writableVolumes performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
 func writableVolumes() []corev1.Volume {
@@ -431,11 +508,21 @@ func writableMounts() []corev1.VolumeMount {
 
 // serviceSpec applies behavior for its receiver performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func (m *Manager) serviceSpec(slotID string, port int) *corev1.Service {
+func (m *Manager) serviceSpec(slotID string, ports []int) *corev1.Service {
 	labels := map[string]string{
 		LabelApp:       AppValue,
 		LabelSlot:      slotID,
 		LabelManagedBy: ManagedByValue,
+	}
+	svcPorts := make([]corev1.ServicePort, len(ports))
+	for i, p := range ports {
+		svcPorts[i] = corev1.ServicePort{
+			// Name is required once a Service declares more than one port.
+			Name:       fmt.Sprintf("port-%d", p),
+			Port:       int32(p),
+			TargetPort: intstr.FromInt(p),
+			Protocol:   corev1.ProtocolTCP,
+		}
 	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -448,11 +535,7 @@ func (m *Manager) serviceSpec(slotID string, port int) *corev1.Service {
 				LabelApp:  AppValue,
 				LabelSlot: slotID,
 			},
-			Ports: []corev1.ServicePort{{
-				Port:       int32(port),
-				TargetPort: intstr.FromInt(port),
-				Protocol:   corev1.ProtocolTCP,
-			}},
+			Ports: svcPorts,
 		},
 	}
 }
@@ -479,7 +562,13 @@ func (m *Manager) ensureCapture(ctx context.Context, pod *corev1.Pod) error {
 	if len(pod.Status.ContainerStatuses) > 0 {
 		containerID = pod.Status.ContainerStatuses[0].ContainerID
 	}
-	job := m.captureJobSpec(slotID, pod.Annotations[captureContestantAnnotation], nodeName, string(pod.UID), containerID)
+	orderBand := topics.OrderBandUnset
+	if raw, ok := pod.Annotations[captureOrderBandAnnotation]; ok {
+		if parsed, err := strconv.ParseUint(raw, 10, 32); err == nil {
+			orderBand = uint32(parsed)
+		}
+	}
+	job := m.captureJobSpec(slotID, pod.Annotations[captureContestantAnnotation], nodeName, string(pod.UID), containerID, orderBand)
 	if _, err := m.client.BatchV1().Jobs(m.namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create capture job: %w", err)
 	}
@@ -488,7 +577,7 @@ func (m *Manager) ensureCapture(ctx context.Context, pod *corev1.Pod) error {
 
 // captureJobSpec applies behavior for its receiver performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func (m *Manager) captureJobSpec(slotID, contestantID, nodeName, podUID, containerID string) *batchv1.Job {
+func (m *Manager) captureJobSpec(slotID, contestantID, nodeName, podUID, containerID string, orderBand uint32) *batchv1.Job {
 	labels := map[string]string{
 		LabelApp:       CaptureAppValue,
 		LabelSlot:      slotID,
@@ -498,7 +587,13 @@ func (m *Manager) captureJobSpec(slotID, contestantID, nodeName, podUID, contain
 	autoMount := false
 	backoffLimit := int32(0)
 	ttl := int32(300)
-	graceful := int64(5)
+	// The capture must be given time to drain its Kafka producer queue on SIGTERM.
+	// Enqueue is fire-and-forget, so anything still queued when SIGKILL lands is
+	// discarded — and each discarded batch costs the orders in it their entire response
+	// record, which downstream reads as a contestant that never answered. At 5s this was
+	// far too short for a queue that batches with linger.ms and can hold hundreds of MB;
+	// it must stay comfortably above the capture's own PRODUCER_FLUSH_TIMEOUT.
+	graceful := int64(60)
 	captureDeadline := captureJobActiveDeadlineSeconds
 	bpffsType := corev1.HostPathDirectoryOrCreate
 
@@ -521,6 +616,10 @@ func (m *Manager) captureJobSpec(slotID, contestantID, nodeName, podUID, contain
 		{Name: "EBPF_ALGO_CONTAINER_ID", Value: containerID},
 		{Name: "EBPF_OBJECT_PATH", Value: captureObjectPath},
 		{Name: "KAFKA_BROKERS", Value: m.kafkaBrokers},
+		// ORDER_BAND: the session's exclusively-leased orders.acked partition
+		// band. topics.OrderBandUnset (math.MaxUint32) means unassigned —
+		// ebpf-latency falls back to hash-derived partitioning.
+		{Name: "ORDER_BAND", Value: strconv.FormatUint(uint64(orderBand), 10)},
 	}
 
 	ownerRefs := []metav1.OwnerReference{{
@@ -588,16 +687,37 @@ func (m *Manager) captureJobSpec(slotID, contestantID, nodeName, podUID, contain
 func captureResources() corev1.ResourceRequirements {
 	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("200m"),
-			corev1.ResourceMemory: resource.MustParse("256Mi"),
+			// 2 (was 200m). The REQUEST, not the limit, is what protects the capture under
+			// node pressure: it sets the CFS weight and the scheduler's floor, so a 200m
+			// request on a container whose userspace path wants ~3 cores meant that any
+			// other work on the node could squeeze it until the ring buffer overflowed.
+			//
+			// Measured: the same max-rate REST workload dropped 23,436 ring-buffer records
+			// (3.2% capture_gaps, session tainted) while the node was busy, and 0 on a quiet
+			// node while decoding MORE records (4,185,669 vs 4,112,553). Kafka was ruled out
+			// (producer_inflight 24) and CFS throttling was 0, so the loss was plain CPU
+			// starvation by neighbours.
+			corev1.ResourceCPU: resource.MustParse("2"),
+			// 2Gi request / 4Gi limit (2026-08-02, was 1Gi/2Gi), in lockstep
+			// with the 256MB BPF ring buffer (ebpf.rs EVENTS): BPF map memory
+			// is memcg-charged to the creating pod since kernel 5.11. The
+			// limit intentionally leaves room for the ring to grow to
+			// 512MB-1GB as a pure config response if contest-rate runs (M2)
+			// ever show drops — headroom bought now so the fix later is one
+			// constant, not a resize. Also covers the matcher's worst case
+			// under an unresponsive engine (500k orders/s x 5s idle window
+			// ~= 2.5M inflight entries), which would otherwise OOM the
+			// capture exactly when measuring the interesting failure mode.
+			corev1.ResourceMemory: resource.MustParse("2Gi"),
 		},
 		Limits: corev1.ResourceList{
 			// 4 (was 2): the userspace drain+parse+publish wants ~3 cores at >150k
-			// delivered; a 2-core cap CFS-throttled it -> ringbuf drops. Burstable
-			// (request stays 200m), so this is safe on a 4-vCPU node and lets the
-			// capture use its needed cores on the c6i.2xlarge (8 vCPU) sandbox node.
+			// delivered; a 2-core cap CFS-throttled it -> ringbuf drops. Still
+			// Burstable (the request above is 2, which sets the CFS weight and
+			// scheduler floor), and lets the capture use its needed cores on
+			// the c6i.2xlarge (8 vCPU) sandbox node.
 			corev1.ResourceCPU:    resource.MustParse("4"),
-			corev1.ResourceMemory: resource.MustParse("512Mi"),
+			corev1.ResourceMemory: resource.MustParse("4Gi"),
 		},
 	}
 }

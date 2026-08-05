@@ -13,6 +13,7 @@ use rdkafka::{
     client::DefaultClientContext,
     config::ClientConfig,
     consumer::{CommitMode, Consumer, StreamConsumer},
+    error::RDKafkaErrorCode,
     message::Message,
     producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer},
     Offset, TopicPartitionList,
@@ -20,7 +21,32 @@ use rdkafka::{
 
 use iicpc_schemas_rust::{BarrierEvent, ReadySignal};
 
-const TOPIC_REPLICATION_FACTOR: i32 = 3;
+/// Replication factor and min.insync.replicas for topics this service creates.
+///
+/// Both default to 1, which is what a single-broker cluster can actually satisfy, and both
+/// are overridable for a real multi-broker deployment.
+///
+/// They used to be hardcoded to 3 and 2. On one broker RF=3 cannot be satisfied, so every
+/// topic creation failed -- and the failure was invisible, because create_topics() returns a
+/// PER-TOPIC result vector that this function never inspected. Worse than the failure was
+/// the shape of it: had the app path ever won the race against the topic-init Job and
+/// created topics with min.insync.replicas=2 on RF=1, EVERY subsequent produce would fail
+/// with NOT_ENOUGH_REPLICAS, because a single replica can never satisfy two in-sync ones.
+/// The live cluster runs RF=1 / min.insync=1, so the code now says what the deployment is.
+const DEFAULT_TOPIC_REPLICATION_FACTOR: i32 = 1;
+const DEFAULT_MIN_INSYNC_REPLICAS: &str = "1";
+
+fn topic_replication_factor() -> i32 {
+    std::env::var("KAFKA_TOPIC_REPLICATION_FACTOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_TOPIC_REPLICATION_FACTOR)
+}
+
+fn min_insync_replicas() -> String {
+    std::env::var("KAFKA_MIN_INSYNC_REPLICAS")
+        .unwrap_or_else(|_| DEFAULT_MIN_INSYNC_REPLICAS.to_string())
+}
 const DEFAULT_TOPIC_PARTITIONS: i32 = 3;
 const HIGH_THROUGHPUT_TOPIC_PARTITIONS: i32 = 24;
 
@@ -46,6 +72,16 @@ pub struct KafkaMessage {
     offset: i64,
 }
 
+impl KafkaMessage {
+    /// partition returns the Kafka partition this message arrived on. The worker keys
+    /// its per-partition single-flight admission on this: at most one workload may
+    /// execute per partition, so that each partition's offset commit stays independent
+    /// of every other partition's.
+    pub fn partition(&self) -> i32 {
+        self.partition
+    }
+}
+
 /// ensure_topics performs the module-specific operation described by its name.
 /// It keeps validation, side effects, and returned values within this module's contract.
 pub async fn ensure_topics(brokers: &str, topics: &[&str]) -> Result<()> {
@@ -54,25 +90,43 @@ pub async fn ensure_topics(brokers: &str, topics: &[&str]) -> Result<()> {
         .create()
         .context("create kafka admin client")?;
 
+    let rf = topic_replication_factor();
+    let insync = min_insync_replicas();
     let new_topics: Vec<NewTopic> = topics
         .iter()
         .map(|topic| {
-            NewTopic::new(
-                topic,
-                topic_partitions(topic),
-                TopicReplication::Fixed(TOPIC_REPLICATION_FACTOR),
-            )
-            .set("min.insync.replicas", "2")
-            .set("retention.ms", topic_retention_ms(topic))
-            .set("max.message.bytes", "1048576")
+            NewTopic::new(topic, topic_partitions(topic), TopicReplication::Fixed(rf))
+                .set("min.insync.replicas", insync.as_str())
+                .set("retention.ms", topic_retention_ms(topic))
+                .set("max.message.bytes", "1048576")
         })
         .collect();
 
-    admin
+    let results = admin
         .create_topics(&new_topics, &AdminOptions::new())
         .await
         .context("create topics")?;
 
+    // Inspect the PER-TOPIC results. The Vec returned here was previously discarded, so a
+    // cluster that could not satisfy the requested replication reported success while
+    // creating nothing -- the failure only surfaced later as a missing topic or as produce
+    // errors, far from the cause. TopicAlreadyExists is the normal path (the topic-init Job
+    // usually wins the race) and is not an error.
+    for r in results {
+        match r {
+            Ok(_) => {}
+            Err((topic, RDKafkaErrorCode::TopicAlreadyExists)) => {
+                tracing::debug!(%topic, "topic already exists");
+            }
+            Err((topic, code)) => {
+                return Err(anyhow::anyhow!(
+                    "create topic {topic}: {code:?} (replication_factor={rf}, \
+                     min.insync.replicas={insync}); a single-broker cluster cannot satisfy \
+                     replication above 1"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -122,6 +176,16 @@ pub fn control_producer(brokers: &str) -> Result<KafkaProducer> {
     Ok(KafkaProducer { inner })
 }
 
+/// filter_compression_level keeps `n` only if it falls within librdkafka's
+/// `compression.level` config-property range (-1..=12). Note this is narrower than
+/// zstd's own native library range (roughly -131072..=22); values outside -1..=12
+/// but inside zstd's native range still make `ClientConfig::create()` fail at
+/// producer construction time, so they must be filtered here rather than passed
+/// through to librdkafka.
+fn filter_compression_level(n: i32) -> Option<i32> {
+    (-1..=12).contains(&n).then_some(n)
+}
+
 /// telemetry_producer performs the module-specific operation described by its name.
 /// It keeps validation, side effects, and returned values within this module's contract.
 pub fn telemetry_producer(brokers: &str) -> Result<KafkaProducer> {
@@ -129,19 +193,26 @@ pub fn telemetry_producer(brokers: &str) -> Result<KafkaProducer> {
     // WITHOUT awaiting delivery (enqueue_to_partition/send_result) and lets rdkafka's
     // background threads pipeline + batch them — so a deep internal queue is what
     // decouples the producer's drain rate from per-batch broker round-trips. linger
-    // accumulates a few ms of batches; lz4 shrinks the wire; the large
-    // queue.buffering bounds in-flight memory and provides backpressure (send_result
-    // returns QueueFull when saturated, which the aggregator handles losslessly).
+    // accumulates a few ms of batches; zstd shrinks the wire further than lz4 (now
+    // that the vendored librdkafka is built with the `zstd` cargo feature, i.e.
+    // libzstd IS compiled in); the large queue.buffering bounds in-flight memory and
+    // provides backpressure (send_result returns QueueFull when saturated, which the
+    // aggregator handles losslessly).
+    let compression_level = std::env::var("KAFKA_TELEMETRY_COMPRESSION_LEVEL")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .and_then(filter_compression_level)
+        .unwrap_or(3); // zstd level 3: fast, good ratio; matches librdkafka's own default
     let inner: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .set("acks", "1")
         // Drain the producer faster per broker round-trip: a longer linger accumulates many
         // app-batches into one large produce request (fewer requests = less broker per-request
-        // CPU + fewer fsyncs), lz4 shrinks the wire (zstd would be better but libzstd isn't
-        // compiled into the vendored librdkafka), and the larger batch ceilings let those big
-        // requests form.
+        // CPU + fewer fsyncs), zstd shrinks the wire more than lz4 did, and the larger batch
+        // ceilings let those big requests form.
         .set("linger.ms", "20")
-        .set("compression.type", "lz4")
+        .set("compression.type", "zstd")
+        .set("compression.level", compression_level.to_string())
         .set("batch.num.messages", "100000")
         .set("batch.size", "4194304") // 4 MiB produce-batch ceiling
         .set("queue.buffering.max.messages", "1000000")
@@ -298,6 +369,26 @@ pub fn enqueue_to_partition(
     }
 }
 
+/// flush_producer blocks until every queued message has been delivered (or the timeout
+/// expires), returning the number still undelivered.
+///
+/// This is NOT optional at shutdown. enqueue_to_partition is fire-and-forget: it hands the
+/// record to librdkafka's internal queue and drops the DeliveryFuture, so "flushed" in the
+/// caller's accounting means ENQUEUED, not delivered. With linger.ms batching and a queue
+/// sized in the hundreds of megabytes, a process that returns without flushing discards
+/// whatever is still queued — silently, since nothing inspects delivery reports. In the
+/// capture that showed up downstream as orders whose responses simply never existed.
+pub fn flush_producer(producer: &KafkaProducer, timeout: Duration) -> Result<i32> {
+    let _ = producer.inner.flush(timeout);
+    Ok(producer.inner.in_flight_count())
+}
+
+/// in_flight_count reports messages queued in the producer but not yet acknowledged by
+/// the broker. A rising value means the producer is being drained slower than it is fed.
+pub fn in_flight_count(producer: &KafkaProducer) -> i32 {
+    producer.inner.in_flight_count()
+}
+
 /// poll drives the producer's background delivery/callback queue. Call it when an
 /// enqueue reports QueueFull to let in-flight messages drain before retrying.
 pub fn poll_producer(producer: &KafkaProducer, timeout: Duration) {
@@ -418,5 +509,23 @@ mod tests {
         assert_eq!(config.get("max.poll.interval.ms"), Some("1800000"));
         assert_eq!(config.get("enable.auto.commit"), Some("false"));
         assert_eq!(config.get("auto.offset.reset"), Some("earliest"));
+    }
+
+    #[test]
+    /// filter_compression_level_matches_librdkafka_range verifies the filter narrows
+    /// to librdkafka's compression.level range (-1..=12), not zstd's native library
+    /// range (-131072..=22) — values in the latter but outside the former crash
+    /// ClientConfig::create() at producer construction time.
+    fn filter_compression_level_matches_librdkafka_range() {
+        for n in [-1, 0, 12] {
+            assert_eq!(filter_compression_level(n), Some(n), "expected {n} to pass");
+        }
+        for n in [15, 19, 22, -5, -131_072, 13, -2] {
+            assert_eq!(
+                filter_compression_level(n),
+                None,
+                "expected {n} to be rejected"
+            );
+        }
     }
 }

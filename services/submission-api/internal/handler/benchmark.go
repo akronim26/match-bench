@@ -168,6 +168,11 @@ func StartBenchmark(pg *store.PostgresStore, pub publisher.Publisher, log *slog.
 			})
 		}
 
+		// The first child is dispatched immediately below, so it enters the DB
+		// as `queued` — the sequential-dispatch claim query only ever touches
+		// `requested` rows and must never re-dispatch it.
+		children[0].Status = topics.RunStatusQueued
+
 		if err := pg.InsertRunGroupWithChildren(ctx, group, children); err != nil {
 			if errors.Is(err, cerrs.ErrActiveRunGroupExists) {
 				existing, ferr := pg.FindActiveRunGroup(ctx, submissionID)
@@ -186,22 +191,29 @@ func StartBenchmark(pg *store.PostgresStore, pub publisher.Publisher, log *slog.
 			return
 		}
 
-		for _, c := range children {
-			if err := pub.PublishBenchmarkRequested(ctx, publisher.BenchmarkMeta{
-				SessionID:    c.SessionID,
-				SubmissionID: c.SubmissionID,
-				ContestantID: c.ContestantID,
-				RunGroupID:   c.RunGroupID,
-				ScenarioID:   c.ScenarioID,
-				RequestedAt:  now,
-			}); err != nil {
-				log.ErrorContext(ctx, "publish benchmark.requested",
-					"session_id", c.SessionID, "scenario_id", c.ScenarioID, "error", err)
-				metrics.Counter("benchmark_publish_failures_total", "Benchmark publish failures by topic.", metrics.Labels("topic", topics.TopicBenchmarkRequested), 1)
-				metrics.Counter("benchmark_requests_total", "Benchmark requests by result.", metrics.Labels("result", "publish_failed"), 1)
-				writeError(w, http.StatusInternalServerError, "failed to publish benchmark request")
-				return
-			}
+		// SEQUENTIAL-WITHIN-GROUP (decision 2026-08-02): publish ONLY the first
+		// scenario. Every child run exists in the DB as `requested`; the
+		// benchmark-status consumer dispatches the next one when the current
+		// session reaches a terminal state (continue-on-fail). A group
+		// therefore holds at most one order band at a time — 4 contestants'
+		// groups run concurrently instead of one group monopolizing all 4
+		// bands. Scenario order = ListScenarios sort_order (correctness gate
+		// first).
+		first := children[0]
+		if err := pub.PublishBenchmarkRequested(ctx, publisher.BenchmarkMeta{
+			SessionID:    first.SessionID,
+			SubmissionID: first.SubmissionID,
+			ContestantID: first.ContestantID,
+			RunGroupID:   first.RunGroupID,
+			ScenarioID:   first.ScenarioID,
+			RequestedAt:  now,
+		}); err != nil {
+			log.ErrorContext(ctx, "publish benchmark.requested",
+				"session_id", first.SessionID, "scenario_id", first.ScenarioID, "error", err)
+			metrics.Counter("benchmark_publish_failures_total", "Benchmark publish failures by topic.", metrics.Labels("topic", topics.TopicBenchmarkRequested), 1)
+			metrics.Counter("benchmark_requests_total", "Benchmark requests by result.", metrics.Labels("result", "publish_failed"), 1)
+			writeError(w, http.StatusInternalServerError, "failed to publish benchmark request")
+			return
 		}
 
 		log.InfoContext(ctx, "benchmark requested",

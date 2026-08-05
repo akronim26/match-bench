@@ -107,28 +107,21 @@ FROM correctness_summary WHERE session_id=$1`, sessionID).
 			sentCount, ackedCount, matchedCount)
 	}
 
-	rows, err := pool.Query(ctx,
-		"SELECT violation_type, order_id FROM correctness_violations WHERE session_id=$1 ORDER BY violation_type", sessionID)
-	if err != nil {
-		t.Fatalf("query violations: %v", err)
+	// The per-violation table is gone (it grew to millions of rows and nothing read
+	// it), so the summary row is the ONLY source for the breakdown the UI renders.
+	// The category counts asserted above cover phantom/overfill/price; these three
+	// complete the set. Their absence is what let a session report 7,860 violations
+	// while the rendered categories totalled 196 — the missing class was missed_fills.
+	var missedFills, lostOrders, lostCancels int64
+	if err := pool.QueryRow(ctx, `
+SELECT missed_fills, lost_orders, lost_cancels
+FROM correctness_summary WHERE session_id=$1`, sessionID).
+		Scan(&missedFills, &lostOrders, &lostCancels); err != nil {
+		t.Fatalf("query violation classes: %v", err)
 	}
-	defer rows.Close()
-	viol := map[string]string{}
-	for rows.Next() {
-		var vt, oid string
-		if err := rows.Scan(&vt, &oid); err != nil {
-			t.Fatalf("scan violation: %v", err)
-		}
-		viol[vt] = oid
-	}
-	if len(viol) != 2 {
-		t.Errorf("violation rows = %d, want 2 (%v)", len(viol), viol)
-	}
-	if viol["overfill"] != "T1" {
-		t.Errorf("overfill violation order = %q, want T1", viol["overfill"])
-	}
-	if viol["phantom"] != "PH" {
-		t.Errorf("phantom violation order = %q, want PH", viol["phantom"])
+	if missedFills != 0 || lostOrders != 0 || lostCancels != 0 {
+		t.Errorf("missed_fills/lost_orders/lost_cancels = %d/%d/%d, want 0/0/0 for this fixture",
+			missedFills, lostOrders, lostCancels)
 	}
 
 	ev, ok := readNewScore(ctx, t, brokers, since, sessionID)
@@ -208,12 +201,16 @@ func TestIntegration_TriggerConsumer(t *testing.T) {
 // It keeps validation, side effects, and returned values within this package's contract.
 func produceSession(ctx context.Context, t *testing.T, brokers []string, sessionID, contestant string) {
 	t.Helper()
-	sent := topics.OrderSentBatch{
+	// POSITIONAL V2 envelope (identity fields hoisted) — what the Rust bot-fleet
+	// producer writes and what StreamSession decodes. Encoding the superseded named-map
+	// OrderSentBatch here would make this integration test pass against a format
+	// nothing produces.
+	sent := topics.OrderSentBatchV2{
 		SessionID: sessionID,
 		WorkerID:  "w0",
-		Events: []topics.OrderSentEvent{
-			{SessionID: sessionID, OrderID: "M1", Price: 100, Qty: 10, Side: "SELL", PayloadType: "NEW", OrdType: "LIMIT"},
-			{SessionID: sessionID, OrderID: "T1", Price: 100, Qty: 10, Side: "BUY", PayloadType: "NEW", OrdType: "LIMIT"},
+		Events: []topics.OrderSentEventFields{
+			{OrderID: "M1", Price: 100, Qty: 10, Side: "SELL", PayloadType: "NEW", OrdType: "LIMIT"},
+			{OrderID: "T1", Price: 100, Qty: 10, Side: "BUY", PayloadType: "NEW", OrdType: "LIMIT"},
 		},
 	}
 	acked := topics.OrderAckedBatch{

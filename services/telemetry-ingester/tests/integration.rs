@@ -7,8 +7,9 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iicpc_schemas_rust::{
-    OrdType, OrderAckedBatch, OrderAckedEvent, OrderSentBatch, OrderSentEvent, PayloadType, Side,
-    TOPIC_ORDERS_ACKED, TOPIC_ORDERS_SENT,
+    OrdType, OrderAckedBatch, OrderAckedEvent, OrderSentBatchV2, OrderSentBatchV2Ref,
+    OrderSentEvent, OrderSentEventFieldsRef, PayloadType, Side, SMP_ID_NONE, TOPIC_ORDERS_ACKED,
+    TOPIC_ORDERS_SENT,
 };
 use iicpc_telemetry_ingester::aggregate::{Aggregator, Snapshot, DEFAULT_WAVE_NS};
 use iicpc_telemetry_ingester::redis_sink::RedisSink;
@@ -91,6 +92,9 @@ fn sent(session: &str, order: &str, t0: u64, t1: u64, r9: u64, timed_out: bool) 
         ord_type: OrdType::Limit,
         orig_order_id: String::new(),
         barrier_epoch_ns: 0,
+        // Explicitly SMP_ID_NONE, never a bare 0: zero is a VALID participant id as well as
+        // Rust's default, so a synthetic event that omits this reads as "participant 0".
+        smp_id: SMP_ID_NONE,
     }
 }
 
@@ -174,6 +178,26 @@ fn aggregate_synthetic(session: &str, contestant: &str) -> (Vec<Snapshot>, Expec
         agg.observe_acked(a);
     }
     (agg.snapshot(now_ns(), 1.0), exp)
+}
+
+/// encode_sent_batch mirrors bot-fleet's telemetry.rs wire encode: positional
+/// msgpack with session_id/submission_id/worker_id hoisted into the envelope
+/// (`OrderSentBatchV2Ref`, `rmp_serde::to_vec`), not the legacy per-event named
+/// format.
+fn encode_sent_batch(session: &str, worker_id: &str, events: &[OrderSentEvent]) -> Vec<u8> {
+    let submission_id = events
+        .first()
+        .map(|e| e.submission_id.as_str())
+        .unwrap_or("sub-1");
+    let event_refs: Vec<OrderSentEventFieldsRef> =
+        events.iter().map(OrderSentEventFieldsRef::from).collect();
+    rmp_serde::to_vec(&OrderSentBatchV2Ref {
+        session_id: session,
+        submission_id,
+        worker_id,
+        events: &event_refs,
+    })
+    .expect("encode orders.sent batch")
 }
 
 /// redis_snapshot_key performs the module-specific operation described by its name.
@@ -275,18 +299,14 @@ async fn kafka_produce_consume_aggregate() {
         .create()
         .expect("producer");
 
-    let sent_batch = OrderSentBatch {
-        session_id: session.clone(),
-        worker_id: "w-1".into(),
-        events: sents,
-    };
     let acked_batch = OrderAckedBatch {
         session_id: session.clone(),
         contestant_id: contestant.clone(),
         events: ackeds,
     };
-    let sent_bytes = rmp_serde::to_vec_named(&sent_batch).unwrap();
+    let sent_bytes = encode_sent_batch(&session, "w-1", &sents);
     let acked_bytes = rmp_serde::to_vec_named(&acked_batch).unwrap();
+    let want_sent = sents.len();
     producer
         .send(
             FutureRecord::to(TOPIC_ORDERS_SENT)
@@ -321,7 +341,6 @@ async fn kafka_produce_consume_aggregate() {
     let mut agg = Aggregator::new(DEFAULT_WAVE_NS);
     let mut seen_sent = 0usize;
     let mut seen_acked = 0usize;
-    let want_sent = sent_batch.events.len();
     let want_acked = acked_batch.events.len();
     let deadline = Instant::now() + Duration::from_secs(20);
     while (seen_sent < want_sent || seen_acked < want_acked) && Instant::now() < deadline {
@@ -330,12 +349,13 @@ async fn kafka_produce_consume_aggregate() {
                 let Some(payload) = m.payload() else { continue };
                 match m.topic() {
                     t if t == TOPIC_ORDERS_SENT => {
-                        if let Ok(b) = rmp_serde::from_slice::<OrderSentBatch>(payload) {
+                        if let Ok(b) = rmp_serde::from_slice::<OrderSentBatchV2>(payload) {
                             if b.session_id == session {
-                                for e in &b.events {
-                                    agg.observe_sent(e);
+                                let count = b.events.len();
+                                for e in b.into_events() {
+                                    agg.observe_sent(&e);
                                 }
-                                seen_sent += b.events.len();
+                                seen_sent += count;
                             }
                         }
                     }
@@ -398,12 +418,7 @@ async fn full_pipeline_kafka_to_timescale_and_redis() {
         .set("message.timeout.ms", "5000")
         .create()
         .unwrap();
-    let sent_bytes = rmp_serde::to_vec_named(&OrderSentBatch {
-        session_id: session.clone(),
-        worker_id: "w-1".into(),
-        events: sents,
-    })
-    .unwrap();
+    let sent_bytes = encode_sent_batch(&session, "w-1", &sents);
     let acked_bytes = rmp_serde::to_vec_named(&OrderAckedBatch {
         session_id: session.clone(),
         contestant_id: contestant.clone(),
@@ -447,10 +462,13 @@ async fn full_pipeline_kafka_to_timescale_and_redis() {
         if let Ok(Ok(m)) = tokio::time::timeout(Duration::from_secs(2), consumer.recv()).await {
             let Some(p) = m.payload() else { continue };
             if m.topic() == TOPIC_ORDERS_SENT {
-                if let Ok(b) = rmp_serde::from_slice::<OrderSentBatch>(p) {
+                if let Ok(b) = rmp_serde::from_slice::<OrderSentBatchV2>(p) {
                     if b.session_id == session {
-                        b.events.iter().for_each(|e| agg.observe_sent(e));
-                        seen += b.events.len();
+                        let count = b.events.len();
+                        b.into_events()
+                            .into_iter()
+                            .for_each(|e| agg.observe_sent(&e));
+                        seen += count;
                     }
                 }
             } else if m.topic() == TOPIC_ORDERS_ACKED {

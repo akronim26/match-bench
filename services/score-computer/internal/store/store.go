@@ -34,6 +34,11 @@ CREATE TABLE IF NOT EXISTS score_progress (
 	sent_count        BIGINT,
 	acked_count       BIGINT,
 	matched_count     BIGINT,
+	jitter_p50_us         DOUBLE PRECISION,
+	jitter_p99_us         DOUBLE PRECISION,
+	jitter_p999_us        DOUBLE PRECISION,
+	jitter_max_us         DOUBLE PRECISION,
+	jitter_inversion_rate DOUBLE PRECISION,
 	updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_score_progress_group ON score_progress(run_group_id);
@@ -44,6 +49,14 @@ CREATE INDEX IF NOT EXISTS idx_score_progress_group ON score_progress(run_group_
 ALTER TABLE score_progress ADD COLUMN IF NOT EXISTS sent_count BIGINT;
 ALTER TABLE score_progress ADD COLUMN IF NOT EXISTS acked_count BIGINT;
 ALTER TABLE score_progress ADD COLUMN IF NOT EXISTS matched_count BIGINT;
+-- P-G jitter (docs/multi-contestant-audit.md §5): cross-flow processing-order
+-- inversion magnitude, mirrored from CorrectnessScoreEvent. NULL/0 means no
+-- recorded inversions (or full-replay mode), same convention as the schema field.
+ALTER TABLE score_progress ADD COLUMN IF NOT EXISTS jitter_p50_us DOUBLE PRECISION;
+ALTER TABLE score_progress ADD COLUMN IF NOT EXISTS jitter_p99_us DOUBLE PRECISION;
+ALTER TABLE score_progress ADD COLUMN IF NOT EXISTS jitter_p999_us DOUBLE PRECISION;
+ALTER TABLE score_progress ADD COLUMN IF NOT EXISTS jitter_max_us DOUBLE PRECISION;
+ALTER TABLE score_progress ADD COLUMN IF NOT EXISTS jitter_inversion_rate DOUBLE PRECISION;
 
 CREATE TABLE IF NOT EXISTS scoring_config (
 	config_id                    TEXT PRIMARY KEY,
@@ -79,6 +92,11 @@ CREATE TABLE IF NOT EXISTS scores (
 	rank                      BIGINT,
 	rank_delta                BIGINT,
 	incomplete_telemetry      BOOLEAN NOT NULL DEFAULT false,
+	jitter_p50_us             DOUBLE PRECISION NOT NULL DEFAULT 0,
+	jitter_p99_us             DOUBLE PRECISION NOT NULL DEFAULT 0,
+	jitter_p999_us            DOUBLE PRECISION NOT NULL DEFAULT 0,
+	jitter_max_us             DOUBLE PRECISION NOT NULL DEFAULT 0,
+	jitter_inversion_rate     DOUBLE PRECISION NOT NULL DEFAULT 0,
 	score_detail              JSONB NOT NULL DEFAULT '{}'::jsonb,
 	computed_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
 	published_at              TIMESTAMPTZ
@@ -88,6 +106,13 @@ CREATE TABLE IF NOT EXISTS scores (
 -- can surface it without parsing score_detail. Idempotent migration; the
 -- false default is correct for historical rows (the gate never fired on them).
 ALTER TABLE scores ADD COLUMN IF NOT EXISTS incomplete_telemetry BOOLEAN NOT NULL DEFAULT false;
+-- P-G jitter, worst-session value across the run-group (see score.Compute).
+-- DEFAULT 0 keeps historical rows valid; 0 means no recorded inversions.
+ALTER TABLE scores ADD COLUMN IF NOT EXISTS jitter_p50_us DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE scores ADD COLUMN IF NOT EXISTS jitter_p99_us DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE scores ADD COLUMN IF NOT EXISTS jitter_p999_us DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE scores ADD COLUMN IF NOT EXISTS jitter_max_us DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE scores ADD COLUMN IF NOT EXISTS jitter_inversion_rate DOUBLE PRECISION NOT NULL DEFAULT 0;
 DROP INDEX IF EXISTS idx_scores_sort_v2;
 CREATE INDEX IF NOT EXISTS idx_scores_sort_v3 ON scores
 	(disqualified ASC, peak_sustained_tps DESC, p99_at_peak_ns ASC, spike_recovery_ns ASC, total_correctness DESC, run_group_id ASC);
@@ -209,8 +234,9 @@ func (s *Store) RecordCorrectness(ctx context.Context, ev topics.CorrectnessScor
 	_, err = s.meta.Exec(ctx, `
 INSERT INTO score_progress
 	(run_group_id, session_id, submission_id, contestant_id, valid_fills, total_fills,
-	 correctness_score, violation_count, correctness_at_ns, sent_count, acked_count, matched_count)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+	 correctness_score, violation_count, correctness_at_ns, sent_count, acked_count, matched_count,
+	 jitter_p50_us, jitter_p99_us, jitter_p999_us, jitter_max_us, jitter_inversion_rate)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
 ON CONFLICT (session_id) DO UPDATE SET
 	run_group_id=EXCLUDED.run_group_id,
 	submission_id=EXCLUDED.submission_id,
@@ -223,10 +249,16 @@ ON CONFLICT (session_id) DO UPDATE SET
 	sent_count=EXCLUDED.sent_count,
 	acked_count=EXCLUDED.acked_count,
 	matched_count=EXCLUDED.matched_count,
+	jitter_p50_us=EXCLUDED.jitter_p50_us,
+	jitter_p99_us=EXCLUDED.jitter_p99_us,
+	jitter_p999_us=EXCLUDED.jitter_p999_us,
+	jitter_max_us=EXCLUDED.jitter_max_us,
+	jitter_inversion_rate=EXCLUDED.jitter_inversion_rate,
 	updated_at=now()`,
 		runGroupID, ev.SessionID, submissionID, contestantID, int64(ev.ValidFills), int64(ev.TotalFills),
 		ev.CorrectnessScore, int64(ev.ViolationCount), int64(ev.ComputedAtNS),
-		int64(ev.SentCount), int64(ev.AckedCount), int64(ev.MatchedCount))
+		int64(ev.SentCount), int64(ev.AckedCount), int64(ev.MatchedCount),
+		ev.JitterP50US, ev.JitterP99US, ev.JitterP999US, ev.JitterMaxUS, ev.JitterInvRate)
 	if err != nil {
 		return nil, err
 	}
@@ -330,7 +362,9 @@ SELECT g.submission_id, g.contestant_id, COALESCE(sub.team_name, '')
 	rows, err := s.meta.Query(ctx, `
 SELECT r.session_id, r.contestant_id, sc.name, sc.duration_ns, sc.task_specs,
        p.valid_fills, p.total_fills, p.violation_count,
-       COALESCE(p.sent_count, 0), COALESCE(p.acked_count, 0), COALESCE(p.matched_count, 0)
+       COALESCE(p.sent_count, 0), COALESCE(p.acked_count, 0), COALESCE(p.matched_count, 0),
+       COALESCE(p.jitter_p50_us, 0), COALESCE(p.jitter_p99_us, 0), COALESCE(p.jitter_p999_us, 0),
+       COALESCE(p.jitter_max_us, 0), COALESCE(p.jitter_inversion_rate, 0)
   FROM runs r
   JOIN scenarios sc ON sc.scenario_id=r.scenario_id
   JOIN score_progress p ON p.session_id=r.session_id
@@ -342,14 +376,15 @@ SELECT r.session_id, r.contestant_id, sc.name, sc.duration_ns, sc.task_specs,
 	defer rows.Close()
 	for rows.Next() {
 		var (
-			sess                            score.Session
-			taskJSON                        []byte
-			valid, total, violations, durNS int64
-			sent, acked, matched            int64
-			contestantID                    string
+			sess                                                       score.Session
+			taskJSON                                                   []byte
+			valid, total, violations, durNS                            int64
+			sent, acked, matched                                       int64
+			jitterP50, jitterP99, jitterP999, jitterMax, jitterInvRate float64
+			contestantID                                               string
 		)
 		if err := rows.Scan(&sess.SessionID, &contestantID, &sess.Scenario, &durNS, &taskJSON, &valid, &total, &violations,
-			&sent, &acked, &matched); err != nil {
+			&sent, &acked, &matched, &jitterP50, &jitterP99, &jitterP999, &jitterMax, &jitterInvRate); err != nil {
 			return in, err
 		}
 		if in.ContestantID == "" {
@@ -367,6 +402,11 @@ SELECT r.session_id, r.contestant_id, sc.name, sc.duration_ns, sc.task_specs,
 			SentCount:      nonNegativeUint64(sent),
 			AckedCount:     nonNegativeUint64(acked),
 			MatchedCount:   nonNegativeUint64(matched),
+			JitterP50US:    jitterP50,
+			JitterP99US:    jitterP99,
+			JitterP999US:   jitterP999,
+			JitterMaxUS:    jitterMax,
+			JitterInvRate:  jitterInvRate,
 		}
 		sess.Metrics, err = s.loadMetrics(ctx, sess.SessionID, in.ContestantID)
 		if err != nil {
@@ -429,12 +469,14 @@ func (s *Store) SaveScore(ctx context.Context, res score.Result) (bool, error) {
 INSERT INTO scores
 	(run_group_id, submission_id, contestant_id, team_name, peak_sustained_tps, p99_at_peak_ns,
 	 spike_recovery_ns, total_correctness, disqualified, disqualification_code, incomplete_telemetry,
+	 jitter_p50_us, jitter_p99_us, jitter_p999_us, jitter_max_us, jitter_inversion_rate,
 	 score_detail, computed_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now())
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,now())
 ON CONFLICT (run_group_id) DO NOTHING`,
 		res.RunGroupID, res.SubmissionID, res.ContestantID, res.TeamName, peak,
 		p99, recovery, res.TotalCorrectness, res.Disqualified,
-		res.DisqualificationCode, res.IncompleteTelemetry, detail)
+		res.DisqualificationCode, res.IncompleteTelemetry,
+		res.JitterP50US, res.JitterP99US, res.JitterP999US, res.JitterMaxUS, res.JitterInvRate, detail)
 	if err != nil {
 		return false, err
 	}

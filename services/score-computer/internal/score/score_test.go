@@ -63,6 +63,57 @@ func TestComputePassingClimbStopsAtFirstFail(t *testing.T) {
 	}
 }
 
+// TestComputeMixedZeroAndPositiveTargetRPSUsesOnlyGradedWaves checks that
+// TargetRPS==0 tasks (the uncapped max-rate sentinel) overlapping the same
+// ramp as throughput-graded (TargetRPS>0) tasks don't suppress the graded
+// waves' PeakSustainedTPS computation.
+func TestComputeMixedZeroAndPositiveTargetRPSUsesOnlyGradedWaves(t *testing.T) {
+	in := baseInput()
+	in.Sessions[2].TaskSpecs = append(in.Sessions[2].TaskSpecs,
+		topics.TaskSpec{TargetRPS: 0, StartOffsetNs: 0, DurationNs: 3 * wave})
+	res, err := Compute(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.MaxRateOnly {
+		t.Fatalf("mixed scenario must not be flagged MaxRateOnly: %#v", res)
+	}
+	if res.PeakSustainedTPS != 30_000 {
+		t.Fatalf("peak=%d, want 30000 (unaffected by zero-target task)", res.PeakSustainedTPS)
+	}
+}
+
+// TestComputeAllZeroTargetRPSIsMaxRateOnly checks that a ramp session made
+// entirely of TargetRPS==0 tasks (correctness-pass-1, not throughput-graded)
+// doesn't zero-fail the scenario: MaxRateOnly must be set and PeakSustainedTPS
+// derived from measured TPS1S rather than the (nonexistent) offered rate.
+func TestComputeAllZeroTargetRPSIsMaxRateOnly(t *testing.T) {
+	in := baseInput()
+	in.Sessions[2].TaskSpecs = []topics.TaskSpec{
+		{TargetRPS: 0, StartOffsetNs: 0, DurationNs: 3 * wave},
+	}
+	in.Sessions[2].Metrics = []MetricRow{
+		{WaveIndex: 0, P99NS: 500_000, ErrorRate: 0, TPS1S: 12_345},
+		{WaveIndex: 1, P99NS: 500_000, ErrorRate: 0, TPS1S: 54_321},
+	}
+	res, err := Compute(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Disqualified {
+		t.Fatalf("all-max-rate scenario must not be disqualified by the peak gate: %#v", res)
+	}
+	if !res.MaxRateOnly {
+		t.Fatalf("want MaxRateOnly=true, got %#v", res)
+	}
+	if res.PeakSustainedTPS != 54_321 {
+		t.Fatalf("peak=%d, want 54321 (max observed TPS1S)", res.PeakSustainedTPS)
+	}
+	if len(res.Waves) != 0 {
+		t.Fatalf("want no throughput-gated waves recorded, got %#v", res.Waves)
+	}
+}
+
 // TestComputeCorrectnessDQ performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
 func TestComputeCorrectnessDQ(t *testing.T) {
@@ -135,7 +186,16 @@ func TestComputeNoRampDisqualifiedReturnsResult(t *testing.T) {
 // It keeps validation, side effects, and returned values within this package's contract.
 func TestComputeNoRampWithoutDQReturnsError(t *testing.T) {
 	in := baseInput()
-	in.Sessions = in.Sessions[:2]
+	// Drop ONLY the ramp. Truncating the slice also removed the pass-1 session, which is
+	// now the sole source of correctness -- the group then scored 0, disqualified, and
+	// Compute returned nil instead of the error this test exists to check.
+	kept := in.Sessions[:0]
+	for _, s := range in.Sessions {
+		if s.Scenario != "ramp" {
+			kept = append(kept, s)
+		}
+	}
+	in.Sessions = kept
 	if _, err := Compute(in); !errors.Is(err, ErrMissingRampSession) {
 		t.Fatalf("err = %v, want ErrMissingRampSession", err)
 	}
@@ -191,7 +251,14 @@ func TestComputeCoverageAtThresholdKeepsViolationDQ(t *testing.T) {
 // It keeps validation, side effects, and returned values within this package's contract.
 func TestComputeIncompleteTelemetryKeepsCorrectnessGates(t *testing.T) {
 	in := baseInput()
-	in.Sessions[0].Correct.ValidFills = 800
+	// Degrade the PASS-1 session: it is the only source of the aggregate correctness
+	// score now, so degrading a pass-2 session would leave the aggregate at 1.0 and
+	// this test would silently stop exercising the gate it is named after.
+	for i := range in.Sessions {
+		if in.Sessions[i].Scenario == ScenarioCorrectness {
+			in.Sessions[i].Correct.ValidFills = 800
+		}
+	}
 	in.Sessions[2].Correct.SentCount = 1000
 	in.Sessions[2].Correct.MatchedCount = 100
 	res, err := Compute(in)
@@ -283,11 +350,80 @@ func TestSortResultsTiebreak(t *testing.T) {
 // It keeps validation, side effects, and returned values within this package's contract.
 func TestAggregateCorrectnessDoesNotOverflow(t *testing.T) {
 	got := aggregateCorrectness([]Session{
-		{Correct: Correctness{ValidFills: math.MaxUint64, TotalFills: math.MaxUint64}},
-		{Correct: Correctness{ValidFills: math.MaxUint64, TotalFills: math.MaxUint64}},
+		{Scenario: ScenarioCorrectness, Correct: Correctness{ValidFills: math.MaxUint64, TotalFills: math.MaxUint64}},
+		{Scenario: ScenarioCorrectness, Correct: Correctness{ValidFills: math.MaxUint64, TotalFills: math.MaxUint64}},
 	})
 	if got != 1 {
 		t.Fatalf("correctness = %v, want 1", got)
+	}
+}
+
+// TestAggregateCorrectnessIgnoresPass2 pins the rule that only the full-replay pass-1
+// session decides correctness. Pass 2 grades book-free invariants, where an engine that
+// fills every order unconditionally scores a perfect 1.0 -- measured at exactly that for
+// the echo engine against 0.62 for the same binary in full mode. Pooling the two let the
+// pass that cannot tell those apart outvote the one that can, weighted by fill count.
+func TestAggregateCorrectnessIgnoresPass2(t *testing.T) {
+	got := aggregateCorrectness([]Session{
+		{Scenario: ScenarioCorrectness, Correct: Correctness{ValidFills: 50, TotalFills: 100}},
+		{Scenario: "constant", Correct: Correctness{ValidFills: 10_000, TotalFills: 10_000}},
+	})
+	if got != 0.5 {
+		t.Fatalf("correctness = %v, want 0.5 (pass-1 only, not diluted by a perfect pass-2)", got)
+	}
+}
+
+// TestAggregateCorrectnessWithoutPass1IsZero: a group never graded against the reference
+// book has no correctness evidence, and must not read as perfect.
+func TestAggregateCorrectnessWithoutPass1IsZero(t *testing.T) {
+	got := aggregateCorrectness([]Session{
+		{Scenario: "constant", Correct: Correctness{ValidFills: 10_000, TotalFills: 10_000}},
+	})
+	if got != 0 {
+		t.Fatalf("correctness = %v, want 0 when no pass-1 session exists", got)
+	}
+}
+
+// TestAggregateJitterTakesWorstSessionPerPercentile verifies aggregateJitter
+// reduces per-session jitter to the max across sessions, independently per
+// field (not the totals from whichever session has the single worst p99).
+func TestAggregateJitterTakesWorstSessionPerPercentile(t *testing.T) {
+	p50, p99, p999, maxUS, invRate := aggregateJitter([]Session{
+		{Correct: Correctness{JitterP50US: 5, JitterP99US: 40, JitterP999US: 80, JitterMaxUS: 100, JitterInvRate: 0.01}},
+		{Correct: Correctness{JitterP50US: 10, JitterP99US: 20, JitterP999US: 90, JitterMaxUS: 50, JitterInvRate: 0.05}},
+	})
+	if p50 != 10 || p99 != 40 || p999 != 90 || maxUS != 100 || invRate != 0.05 {
+		t.Fatalf("aggregateJitter = (%v,%v,%v,%v,%v), want (10,40,90,100,0.05)", p50, p99, p999, maxUS, invRate)
+	}
+}
+
+// TestAggregateJitterZeroWhenNoSessions verifies the zero-inversions default
+// (no recorded jitter anywhere) round-trips as all-zero, matching the
+// CorrectnessScoreEvent convention.
+func TestAggregateJitterZeroWhenNoSessions(t *testing.T) {
+	p50, p99, p999, maxUS, invRate := aggregateJitter(nil)
+	if p50 != 0 || p99 != 0 || p999 != 0 || maxUS != 0 || invRate != 0 {
+		t.Fatalf("aggregateJitter(nil) = (%v,%v,%v,%v,%v), want all zero", p50, p99, p999, maxUS, invRate)
+	}
+}
+
+// TestComputePropagatesJitterIntoResult verifies Compute() surfaces the
+// aggregated jitter fields onto Result, so score-computer's SaveScore has
+// them available to persist alongside the rest of the run-group score row.
+func TestComputePropagatesJitterIntoResult(t *testing.T) {
+	in := baseInput()
+	in.Sessions[2].Correct.JitterP50US = 12.5
+	in.Sessions[2].Correct.JitterP99US = 88.25
+	in.Sessions[2].Correct.JitterP999US = 150
+	in.Sessions[2].Correct.JitterMaxUS = 300
+	in.Sessions[2].Correct.JitterInvRate = 0.002
+	res, err := Compute(in)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if res.JitterP50US != 12.5 || res.JitterP99US != 88.25 || res.JitterP999US != 150 ||
+		res.JitterMaxUS != 300 || res.JitterInvRate != 0.002 {
+		t.Fatalf("Result jitter fields not propagated: %+v", res)
 	}
 }
 
@@ -328,6 +464,35 @@ func baseInput() Input {
 					{WaveIndex: 2, P99NS: 900_000, ErrorRate: 0},
 				},
 			},
+			// LAST on purpose: several tests address sessions positionally
+			// (in.Sessions[2] is the ramp), so this must not shift their indices.
+			// Correctness now comes only from the pass-1 session; without one the group
+			// scores 0 and every fixture here would disqualify for a reason unrelated to
+			// what it actually tests.
+			{SessionID: "correctness", Scenario: ScenarioCorrectness, Correct: correct},
 		},
+	}
+}
+
+// TestP99AtPeakIsStableNotWorstSecond pins the 2026-08-02 ranking decision:
+// the TPS tiebreak uses the STABLE p99 (median of the peak wave's per-second
+// p99s) — the same summary the pass/fail gate uses — not the wave's single
+// worst second, which is dominated by connection-setup/warmup noise and had
+// been deciding ties despite its own "diagnostic" comment.
+func TestP99AtPeakIsStableNotWorstSecond(t *testing.T) {
+	in := baseInput()
+	// Three seconds within the first JUDGED wave (the climb starts at wave
+	// index 1; wave 0 is baseline): median 500us, worst second 900us.
+	in.Sessions[2].Metrics = []MetricRow{
+		{WaveIndex: 1, P99NS: 100_000, ErrorRate: 0.001},
+		{WaveIndex: 1, P99NS: 500_000, ErrorRate: 0.001},
+		{WaveIndex: 1, P99NS: 900_000, ErrorRate: 0.001},
+	}
+	res, err := Compute(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.P99AtPeakNS != 500_000 {
+		t.Fatalf("P99AtPeakNS = %d, want 500000 (stable/median), not the 900000 worst second", res.P99AtPeakNS)
 	}
 }

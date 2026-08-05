@@ -28,6 +28,49 @@ const (
 
 const rankedOrder = `disqualified ASC, peak_sustained_tps DESC, p99_at_peak_ns ASC, spike_recovery_ns ASC, total_correctness DESC, run_group_id ASC`
 
+// leaderboardQuerySQL is the static (order-by-independent) body of the paged
+// Leaderboard() query. Kept as a named const so tests can pin the selected
+// column list without a live Postgres connection.
+const leaderboardQuerySQL = `
+SELECT rank, run_group_id, submission_id, contestant_id, team_name, peak_sustained_tps,
+       p99_at_peak_ns, spike_recovery_ns, total_correctness, disqualified,
+       disqualification_code, COALESCE(rank_delta,0), computed_at,
+       jitter_p50_us, jitter_p99_us, jitter_p999_us, jitter_max_us, jitter_inversion_rate
+  FROM (
+	SELECT ROW_NUMBER() OVER (ORDER BY ` + rankedOrder + `) AS rank,
+	       run_group_id, submission_id, contestant_id, team_name, peak_sustained_tps,
+	       p99_at_peak_ns, spike_recovery_ns, total_correctness, disqualified,
+	       disqualification_code, rank_delta, computed_at,
+	       jitter_p50_us, jitter_p99_us, jitter_p999_us, jitter_max_us, jitter_inversion_rate
+	  FROM scores
+  ) ranked
+ WHERE ($1='' OR run_group_id=$1)
+   AND ($2='' OR submission_id=$2)
+   AND ($3='' OR contestant_id=$3)
+   AND ($4='' OR team_name ILIKE '%' || $4 || '%')
+   AND ($7='' OR EXISTS (
+         SELECT 1 FROM runs r2
+           JOIN scenarios sc2 ON sc2.scenario_id = r2.scenario_id
+          WHERE r2.run_group_id = ranked.run_group_id AND sc2.name = $7))
+`
+
+// scoreForRunGroupQuerySQL is the static body of the single-row
+// scoreForRunGroup() query, named for the same reason as leaderboardQuerySQL.
+const scoreForRunGroupQuerySQL = `
+SELECT rank, run_group_id, submission_id, contestant_id, team_name, peak_sustained_tps,
+       p99_at_peak_ns, spike_recovery_ns, total_correctness, disqualified,
+       disqualification_code, COALESCE(rank_delta,0), computed_at,
+       jitter_p50_us, jitter_p99_us, jitter_p999_us, jitter_max_us, jitter_inversion_rate
+  FROM (
+	SELECT ROW_NUMBER() OVER (ORDER BY ` + rankedOrder + `) AS rank,
+	       run_group_id, submission_id, contestant_id, team_name, peak_sustained_tps,
+	       p99_at_peak_ns, spike_recovery_ns, total_correctness, disqualified,
+	       disqualification_code, rank_delta, computed_at,
+	       jitter_p50_us, jitter_p99_us, jitter_p999_us, jitter_max_us, jitter_inversion_rate
+	  FROM scores
+  ) ranked
+ WHERE run_group_id=$1`
+
 // Store groups the state and dependencies used by this package.
 // Keep this type aligned with the runtime contract around it.
 type Store struct {
@@ -108,6 +151,14 @@ type LeaderboardRow struct {
 	DisqualificationCode string  `json:"disqualification_code,omitempty"`
 	RankDelta            int64   `json:"rank_delta"`
 	ComputedAtUnixNS     int64   `json:"computed_at_ns"`
+	// Jitter* is the P-G jitter (cross-flow processing-order inversion
+	// magnitude, microseconds) worst-case across the run-group's sessions,
+	// mirrored from CorrectnessScoreEvent. Zero means no recorded inversions.
+	JitterP50US   float64 `json:"jitter_p50_us"`
+	JitterP99US   float64 `json:"jitter_p99_us"`
+	JitterP999US  float64 `json:"jitter_p999_us"`
+	JitterMaxUS   float64 `json:"jitter_max_us"`
+	JitterInvRate float64 `json:"jitter_inversion_rate"`
 }
 
 // Leaderboard applies behavior for its receiver performs the package-specific operation described by its name.
@@ -126,25 +177,7 @@ func (s *Store) Leaderboard(ctx context.Context, q LeaderboardQuery) (Leaderboar
 		contestantFilter = q.TeamID
 	}
 	orderBy := leaderboardOrderBy(q.Sort, q.Order)
-	rows, err := s.meta.Query(ctx, `
-SELECT rank, run_group_id, submission_id, contestant_id, team_name, peak_sustained_tps,
-       p99_at_peak_ns, spike_recovery_ns, total_correctness, disqualified,
-       disqualification_code, COALESCE(rank_delta,0), computed_at
-  FROM (
-	SELECT ROW_NUMBER() OVER (ORDER BY `+rankedOrder+`) AS rank,
-	       run_group_id, submission_id, contestant_id, team_name, peak_sustained_tps,
-	       p99_at_peak_ns, spike_recovery_ns, total_correctness, disqualified,
-	       disqualification_code, rank_delta, computed_at
-	  FROM scores
-  ) ranked
- WHERE ($1='' OR run_group_id=$1)
-   AND ($2='' OR submission_id=$2)
-   AND ($3='' OR contestant_id=$3)
-   AND ($4='' OR team_name ILIKE '%' || $4 || '%')
-   AND ($7='' OR EXISTS (
-         SELECT 1 FROM runs r2
-           JOIN scenarios sc2 ON sc2.scenario_id = r2.scenario_id
-          WHERE r2.run_group_id = ranked.run_group_id AND sc2.name = $7))
+	rows, err := s.meta.Query(ctx, leaderboardQuerySQL+`
  ORDER BY `+orderBy+`
  LIMIT $5 OFFSET $6`, q.RunGroupID, q.SubmissionID, contestantFilter, q.TeamName, limit+1, offset, q.Scenario)
 	if err != nil {
@@ -161,7 +194,8 @@ SELECT rank, run_group_id, submission_id, contestant_id, team_name, peak_sustain
 		var peak, p99, recovery int64
 		var computed time.Time
 		if err := rows.Scan(&r.Rank, &r.RunGroupID, &r.SubmissionID, &r.ContestantID, &r.TeamName, &peak, &p99,
-			&recovery, &r.TotalCorrectness, &r.Disqualified, &r.DisqualificationCode, &r.RankDelta, &computed); err != nil {
+			&recovery, &r.TotalCorrectness, &r.Disqualified, &r.DisqualificationCode, &r.RankDelta, &computed,
+			&r.JitterP50US, &r.JitterP99US, &r.JitterP999US, &r.JitterMaxUS, &r.JitterInvRate); err != nil {
 			return resp, err
 		}
 		r.PeakSustainedTPS = nonNegativeUint64(peak)
@@ -370,12 +404,14 @@ SELECT EXTRACT(EPOCH FROM time) * 1000000000, wave_index,
 
 // ViolationCounts returns the per-category violation totals for a run-group,
 // read straight from the pre-aggregated correctness_summary row (one row per
-// session). The raw per-violation table is no longer scanned — the validator
-// writes these six category counters at score time.
+// session). There is no per-violation table: storing one row per violation
+// reached tens of millions of rows at high TPS for data nothing rendered, so the
+// validator writes these category counters at score time instead.
 func (s *Store) ViolationCounts(ctx context.Context, runGroupID string) ([]ViolationCount, error) {
 	rows, err := s.meta.Query(ctx, `
 SELECT r.session_id, cs.price_violations, cs.self_trades, cs.phantom_fills,
-       cs.time_violations, cs.cancel_replace_loss, cs.overfills
+       cs.time_violations, cs.cancel_replace_loss, cs.overfills,
+       cs.missed_fills, cs.lost_orders, cs.lost_cancels
   FROM runs r
   JOIN correctness_summary cs ON cs.session_id = r.session_id
  WHERE r.run_group_id = $1`, runGroupID)
@@ -387,9 +423,16 @@ SELECT r.session_id, cs.price_violations, cs.self_trades, cs.phantom_fills,
 	for rows.Next() {
 		var sessionID string
 		var price, selfTrade, phantom, timeV, crl, overfill int64
-		if err := rows.Scan(&sessionID, &price, &selfTrade, &phantom, &timeV, &crl, &overfill); err != nil {
+		var missed, lostOrders, lostCancels int64
+		if err := rows.Scan(&sessionID, &price, &selfTrade, &phantom, &timeV, &crl, &overfill,
+			&missed, &lostOrders, &lostCancels); err != nil {
 			return nil, err
 		}
+		// These must cover EVERY class counted into violation_count, or the
+		// breakdown silently fails to add up to the headline the UI shows beside
+		// it. missed_fills was the omission that made this obvious: one session
+		// reported 7,860 violations of which 7,663 were missed fills, so the
+		// categories shown totalled 196.
 		for _, c := range []ViolationCount{
 			{SessionID: sessionID, ViolationType: "price", Count: price},
 			{SessionID: sessionID, ViolationType: "self_trade", Count: selfTrade},
@@ -397,6 +440,9 @@ SELECT r.session_id, cs.price_violations, cs.self_trades, cs.phantom_fills,
 			{SessionID: sessionID, ViolationType: "time", Count: timeV},
 			{SessionID: sessionID, ViolationType: "cancel_replace_loss", Count: crl},
 			{SessionID: sessionID, ViolationType: "overfill", Count: overfill},
+			{SessionID: sessionID, ViolationType: "missed_fill", Count: missed},
+			{SessionID: sessionID, ViolationType: "lost_order", Count: lostOrders},
+			{SessionID: sessionID, ViolationType: "lost_cancel", Count: lostCancels},
 		} {
 			if c.Count > 0 {
 				out = append(out, c)
@@ -459,6 +505,39 @@ SELECT rg.run_group_id, COALESCE(sub.team_name,''), r.session_id, sc.name, r.sta
 	return out, rows.Err()
 }
 
+// ActiveSessionContestant groups the state and dependencies used by this package.
+// Keep this type aligned with the runtime contract around it.
+type ActiveSessionContestant struct {
+	SessionID    string
+	ContestantID string
+}
+
+// ActiveSessionContestants returns the contestant_id for each session belonging to a run
+// that is not yet completed or failed.
+func (s *Store) ActiveSessionContestants(ctx context.Context) ([]ActiveSessionContestant, error) {
+	rows, err := s.meta.Query(ctx, `
+SELECT r.session_id, COALESCE(sub.contestant_id,'')
+  FROM run_groups rg
+  JOIN runs r ON r.run_group_id = rg.run_group_id
+  LEFT JOIN submissions sub ON sub.submission_id = rg.submission_id
+ WHERE r.status NOT IN ('completed','failed')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ActiveSessionContestant
+	for rows.Next() {
+		var sc ActiveSessionContestant
+		if err := rows.Scan(&sc.SessionID, &sc.ContestantID); err != nil {
+			return nil, err
+		}
+		if sc.ContestantID != "" {
+			out = append(out, sc)
+		}
+	}
+	return out, rows.Err()
+}
+
 // String applies behavior for its receiver performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
 func (s *Store) String() string { return fmt.Sprintf("read.Store(%p)", s) }
@@ -466,18 +545,7 @@ func (s *Store) String() string { return fmt.Sprintf("read.Store(%p)", s) }
 // scoreForRunGroup applies behavior for its receiver performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
 func (s *Store) scoreForRunGroup(ctx context.Context, runGroupID string) (LeaderboardRow, bool, error) {
-	rows, err := s.meta.Query(ctx, `
-SELECT rank, run_group_id, submission_id, contestant_id, team_name, peak_sustained_tps,
-       p99_at_peak_ns, spike_recovery_ns, total_correctness, disqualified,
-       disqualification_code, COALESCE(rank_delta,0), computed_at
-  FROM (
-	SELECT ROW_NUMBER() OVER (ORDER BY `+rankedOrder+`) AS rank,
-	       run_group_id, submission_id, contestant_id, team_name, peak_sustained_tps,
-	       p99_at_peak_ns, spike_recovery_ns, total_correctness, disqualified,
-	       disqualification_code, rank_delta, computed_at
-	  FROM scores
-  ) ranked
- WHERE run_group_id=$1`, runGroupID)
+	rows, err := s.meta.Query(ctx, scoreForRunGroupQuerySQL, runGroupID)
 	if err != nil {
 		return LeaderboardRow{}, false, err
 	}
@@ -489,7 +557,8 @@ SELECT rank, run_group_id, submission_id, contestant_id, team_name, peak_sustain
 	var peak, p99, recovery int64
 	var computed time.Time
 	if err := rows.Scan(&r.Rank, &r.RunGroupID, &r.SubmissionID, &r.ContestantID, &r.TeamName, &peak, &p99,
-		&recovery, &r.TotalCorrectness, &r.Disqualified, &r.DisqualificationCode, &r.RankDelta, &computed); err != nil {
+		&recovery, &r.TotalCorrectness, &r.Disqualified, &r.DisqualificationCode, &r.RankDelta, &computed,
+		&r.JitterP50US, &r.JitterP99US, &r.JitterP999US, &r.JitterMaxUS, &r.JitterInvRate); err != nil {
 		return LeaderboardRow{}, false, err
 	}
 	r.PeakSustainedTPS = nonNegativeUint64(peak)

@@ -31,6 +31,7 @@ var (
 	ErrMissingBuildTarget    = errors.New("build.target is required in benchmark.yaml")
 	ErrInvalidBuildTarget    = errors.New("build.target contains invalid characters (allowed: A-Za-z0-9 _ . -, max 64)")
 	ErrInvalidPortRange      = errors.New("port out of allowed range (1024–65535)")
+	ErrPortProtocolMismatch  = errors.New("port does not match the platform-mandated port for the declared protocol (FIX=9898, REST/WS=8080)")
 	ErrRootConfigTooLarge    = errors.New("root config/build file exceeds 1 MiB after decompression")
 	ErrMissingCMakeLists     = errors.New("cpp project must include CMakeLists.txt at zip root")
 	ErrMissingCargoToml      = errors.New("rust project must include Cargo.toml at zip root")

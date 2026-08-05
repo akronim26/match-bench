@@ -101,5 +101,18 @@ type Order struct {
 	Qty         uint64
 	Kind        Kind
 	OrigOrderID string // referenced order for cancel/replace (from acked tag 41)
-	Responses   []Response
+	// SMPID is the self-match-prevention id this order was sent under, taken from the
+	// orders.sent telemetry event (the bot is the authority on what it assigned, so
+	// the eBPF capture never has to parse FIX tag 7928).
+	//
+	// HasSMPID distinguishes "no id" from "id 0" — 0 is a VALID id, so the zero value
+	// of this field cannot be used as the absent marker. An Order built without an
+	// explicit id (any of the book's test helpers, and any future construction site
+	// that predates SMP) is therefore UNCONSTRAINED by default, which is both the safe
+	// direction and what pass-2 traffic actually is. Conflating the two would make
+	// every id-less order look like participant 0 and, under skip-and-continue, stop
+	// an engine matching anything at all.
+	SMPID     uint32
+	HasSMPID  bool
+	Responses []Response
 }

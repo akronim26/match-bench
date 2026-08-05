@@ -53,51 +53,43 @@ func NewProducer(brokers string, log *slog.Logger) *Producer {
 		}
 	}
 	return &Producer{
-		workloadWriter: mk(topics.TopicWorkloadAssignments, &workerIndexBalancer{}),
+		workloadWriter: mk(topics.TopicWorkloadAssignments, &leasedPartitionBalancer{}),
 		barrierWriter:  mk(topics.TopicBarrier, &kafka.Hash{}),
 		statusWriter:   mk(topics.TopicBenchmarkStatusUpdated, &kafka.Hash{}),
 		log:            log,
 	}
 }
 
-// workerIndexBalancer groups the state and dependencies used by this package.
-// Keep this type aligned with the runtime contract around it.
-type workerIndexBalancer struct {
+// leasedPartitionBalancer routes each workload spec to the exact partition
+// its session leased from PartitionLeaseAllocator (buildWorkloadMessages
+// stamps it into WriterData), replacing the session-agnostic
+// worker_index % partitions scheme that let worker 0 of every concurrent
+// session collide on partition 0.
+type leasedPartitionBalancer struct {
 	fallback kafka.Hash
 }
 
 // Balance applies behavior for its receiver performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func (b *workerIndexBalancer) Balance(msg kafka.Message, partitions ...int) int {
-	idx, ok := msg.WriterData.(uint32)
+func (b *leasedPartitionBalancer) Balance(msg kafka.Message, partitions ...int) int {
+	leased, ok := msg.WriterData.(int)
 	if !ok {
 		return b.fallback.Balance(msg, partitions...)
 	}
-	return partitions[workerPartition(idx, len(partitions))]
-}
-
-// workerPartition performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func workerPartition(workerIndex uint32, numPartitions int) int {
-	if numPartitions <= 0 {
-		return 0
+	for _, p := range partitions {
+		if p == leased {
+			return p
+		}
 	}
-	return int(workerIndex % uint32(numPartitions))
-}
-
-// validateWorkerCapacity performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func validateWorkerCapacity(workerCount, partitions int) error {
-	if partitions <= 0 {
-		return fmt.Errorf("workload.assignments reports %d partitions; cannot assign workers", partitions)
-	}
-	if workerCount > partitions {
-		return fmt.Errorf(
-			"worker_count %d exceeds workload.assignments partition count %d: two specs would share a partition (serial execution, missed barrier); lower MAX_TASKS_PER_WORKER's resulting worker count or repartition the topic",
-			workerCount, partitions,
-		)
-	}
-	return nil
+	// Leased partition absent from the writer's current metadata view (stale
+	// metadata / broker blip). Return the leased partition anyway: the lease
+	// is the routing authority, and a genuinely nonexistent partition surfaces
+	// as a loud write error that fails this session's publish. Hash-falling
+	// back here would silently land the spec on another session's leased
+	// partition — the exact collision leasing exists to prevent.
+	metrics.Counter("controller_leased_partition_not_in_metadata_total",
+		"Workload publishes whose leased partition was missing from writer metadata.", nil, 1)
+	return leased
 }
 
 // Close applies behavior for its receiver performs the package-specific operation described by its name.
@@ -118,30 +110,29 @@ func (p *Producer) Close() error {
 	return firstErr
 }
 
-// PublishWorkloadSpec applies behavior for its receiver performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func (p *Producer) PublishWorkloadSpec(ctx context.Context, specs []topics.WorkloadSpec) error {
+// PublishWorkloadSpec publishes specs onto their explicitly leased
+// partitions. leases[i] is the partition specs[i] was granted by
+// PartitionLeaseAllocator; the two slices must be the same length, and it is
+// the caller's job to have already leased that many partitions for the
+// session (Runner does this before calling in).
+func (p *Producer) PublishWorkloadSpec(ctx context.Context, specs []topics.WorkloadSpec, leases []int) error {
 	if p.noop {
 		return nil
 	}
 	start := time.Now()
-	partitions, err := p.workloadPartitionCount(ctx)
-	if err != nil {
-		recordProduce(topics.TopicWorkloadAssignments, start, err)
-		return fmt.Errorf("read workload.assignments partition count: %w", err)
-	}
-	if err := validateWorkerCapacity(len(specs), partitions); err != nil {
+	if len(leases) != len(specs) {
+		err := fmt.Errorf("%d leased partitions for %d workload specs: mismatch", len(leases), len(specs))
 		recordProduce(topics.TopicWorkloadAssignments, start, err)
 		return err
 	}
-	msgs, err := buildWorkloadMessages(specs)
+	msgs, err := buildWorkloadMessages(specs, leases)
 	if err != nil {
 		recordProduce(topics.TopicWorkloadAssignments, start, err)
 		return err
 	}
 	p.log.Info("publishing workload specs with explicit partition assignment",
 		"worker_count", len(specs),
-		"workload_partitions", partitions,
+		"leased_partitions", leases,
 		"note", "bot-fleet replicas must be >= worker_count before fan-in completes (KEDA pre-scale)",
 	)
 	writeCtx, cancel := context.WithTimeout(ctx, writerTimeout)
@@ -154,9 +145,9 @@ func (p *Producer) PublishWorkloadSpec(ctx context.Context, specs []topics.Workl
 
 // buildWorkloadMessages performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func buildWorkloadMessages(specs []topics.WorkloadSpec) ([]kafka.Message, error) {
+func buildWorkloadMessages(specs []topics.WorkloadSpec, leases []int) ([]kafka.Message, error) {
 	msgs := make([]kafka.Message, 0, len(specs))
-	for _, spec := range specs {
+	for i, spec := range specs {
 		payload, err := json.Marshal(spec)
 		if err != nil {
 			return nil, fmt.Errorf("marshal workload spec: %w", err)
@@ -164,10 +155,20 @@ func buildWorkloadMessages(specs []topics.WorkloadSpec) ([]kafka.Message, error)
 		msgs = append(msgs, kafka.Message{
 			Key:        []byte(fmt.Sprintf("%s:%d", spec.SessionID, spec.WorkerIndex)),
 			Value:      payload,
-			WriterData: spec.WorkerIndex,
+			WriterData: leases[i],
 		})
 	}
 	return msgs, nil
+}
+
+// WorkloadPartitionCount returns the number of partitions on
+// workload.assignments, caching the result. Used to size the
+// PartitionLeaseAllocator at startup.
+func (p *Producer) WorkloadPartitionCount(ctx context.Context) (int, error) {
+	if p.noop {
+		return 0, fmt.Errorf("producer is in noop mode (KAFKA_BROKERS not set)")
+	}
+	return p.workloadPartitionCount(ctx)
 }
 
 // workloadPartitionCount applies behavior for its receiver performs the package-specific operation described by its name.

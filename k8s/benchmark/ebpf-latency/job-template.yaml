@@ -46,14 +46,25 @@ spec:
               containerPort: 9090
           resources:
             requests:
-              cpu: 200m
-              memory: 256Mi
+              # 2 (was 200m). The request, not the limit, is what protects this container
+              # under node pressure — it sets the CFS weight and the scheduler's floor.
+              # Measured: identical max-rate workloads dropped 23,436 ring-buffer records on
+              # a busy node and 0 on a quiet one, with no CFS throttling either time, i.e.
+              # plain CPU starvation by neighbours. Keep in sync with captureResources() in
+              # sandbox-orchestrator/internal/k8s/slot.go.
+              cpu: "2"
+              # REFERENCE ONLY: nothing consumes this template — the orchestrator
+              # builds capture Jobs programmatically (slot.go captureResources is
+              # the authority). Values kept aligned so a reader is not misled:
+              # 2Gi/4Gi (2026-08-02) pairs with the 256MB memcg-charged BPF ring
+              # and leaves ring-growth headroom to 1GB.
+              memory: 2Gi
             limits:
               # 4 (was 2): at >150k delivered the userspace drain+parse+publish wants
               # ~3 cores; a 2-core cap CFS-throttled it and caused ringbuf drops. Fits
               # the c6i.2xlarge (8 vCPU) sandbox node alongside the contestant (ALGO_CPU=4).
               cpu: "4"
-              memory: 512Mi
+              memory: 4Gi
           securityContext:
             privileged: true
             capabilities:

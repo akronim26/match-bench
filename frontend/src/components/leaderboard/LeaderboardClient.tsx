@@ -43,8 +43,9 @@ export function LeaderboardClient() {
   const [sortBy, setSortBy] = useState<SortBy>("rank");
   const [sortOrder, setSortOrder] = useState<SortOrder>("asc");
   const [page, setPage] = useState(1);
-  const { data, isLoading, error, sseStatus, flashedRows } =
+  const { data, isLoading, error, sseStatus, flashedRows, liveMetrics } =
     useLeaderboard(category);
+  const liveMetricsList = Object.values(liveMetrics);
 
   const rows = useMemo(() => {
     const sorted = [...(data?.rows ?? [])].sort((a, b) => {
@@ -87,6 +88,26 @@ export function LeaderboardClient() {
       </div>
       {error && (
         <ErrorBanner message="Leaderboard API is unavailable. Start or connect the platform leaderboard service to load live standings." />
+      )}
+      {liveMetricsList.length > 0 && (
+        <div className={styles.liveTiles}>
+          {liveMetricsList.map((metric) => (
+            <div
+              key={`${metric.session_id}:${metric.contestant_id}`}
+              className={styles.liveTile}
+            >
+              <span className={styles.liveTileLabel}>
+                {metric.contestant_id} · {metric.session_id}
+              </span>
+              <span className={styles.liveTileStat}>
+                {Math.round(metric.tps_1s).toLocaleString()} tps
+              </span>
+              <span className={styles.liveTileStat}>
+                p99 {(metric.p99_ns / 1_000_000).toFixed(1)}ms
+              </span>
+            </div>
+          ))}
+        </div>
       )}
       <div className={styles.split}>
         <div className={styles.tableCol}>

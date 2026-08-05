@@ -62,3 +62,8 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, bool, error) {
 func (c *Client) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
 	return c.client.Set(ctx, key, value, ttl).Err()
 }
+
+// HGetAll returns all fields of the hash at key, or an empty map if the key does not exist.
+func (c *Client) HGetAll(ctx context.Context, key string) (map[string]string, error) {
+	return c.client.HGetAll(ctx, key).Result()
+}

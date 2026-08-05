@@ -1,0 +1,57 @@
+# overlays/local-k3s — the laptop k3s environment.
+#   kubectl apply -k overlays/local-k3s
+# Owns: locally-built image refs (iicpc/*:dev1, imported into containerd via
+# deploy-local/import-dev-images.sh), the campus CoreDNS workaround (LOCAL
+# ONLY — it must never reach EKS, and living only in this directory makes that
+# structural), and the local scenario seed (correctness + constant; small
+# enough for a laptop run).
+# Sizing stays at base values: ALGO_CPU=2/1Gi and shared-node bot workers are
+# the correct LOCAL shape — the contest shape lives in overlays/eks-contest.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../k8s
+  - coredns-custom.yaml
+
+images:
+  - name: ghcr.io/agrawalx/submission-api
+    newName: iicpc/submission-api
+    newTag: dev1
+  - name: ghcr.io/agrawalx/auth-api
+    newName: iicpc/auth-api
+    newTag: dev1
+  - name: ghcr.io/agrawalx/leaderboard-api
+    newName: iicpc/leaderboard-api
+    newTag: dev1
+  - name: ghcr.io/agrawalx/frontend
+    newName: iicpc/frontend
+    newTag: dev1
+  - name: ghcr.io/agrawalx/spawner
+    newName: iicpc/spawner
+    newTag: dev1
+  - name: ghcr.io/agrawalx/sandbox-orchestrator
+    newName: iicpc/sandbox-orchestrator
+    newTag: dev1
+  - name: ghcr.io/agrawalx/bot-fleet-controller
+    newName: iicpc/bot-fleet-controller
+    newTag: dev1
+  - name: ghcr.io/agrawalx/bot-fleet
+    newName: iicpc/bot-fleet
+    newTag: dev1
+  - name: ghcr.io/agrawalx/correctness-validator
+    newName: iicpc/correctness-validator
+    newTag: dev1
+  - name: ghcr.io/agrawalx/score-computer
+    newName: iicpc/score-computer
+    newTag: dev1
+  - name: ghcr.io/agrawalx/telemetry-ingester
+    newName: iicpc/telemetry-ingester
+    newTag: dev1
+
+patches:
+  - path: patch-submission-api-seed.yaml
+    target:
+      kind: Deployment
+      name: submission-api
+      namespace: platform

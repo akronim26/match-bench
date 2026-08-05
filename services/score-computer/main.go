@@ -49,6 +49,19 @@ func main() {
 	defer st.Close()
 	redisClient := redis.New(cfg.RedisAddr)
 	defer redisClient.Close()
+
+	// One-shot cleanup of the orphaned `leaderboard:global` ZSET (writer/reader
+	// code removed in a prior commit, key never deleted). Redis being
+	// unreachable here is tolerated the same way readyz already tolerates it
+	// elsewhere — this must not block startup.
+	if deleted, err := redisClient.DeleteLegacyGlobalLeaderboard(ctx); err != nil {
+		log.Warn("legacy leaderboard:global cleanup skipped", "error", err)
+	} else if deleted {
+		log.Info("deleted legacy leaderboard:global key")
+	} else {
+		log.Info("legacy leaderboard:global key not found, nothing to clean up")
+	}
+
 	pub := publisher.New(cfg.KafkaBrokers)
 	defer pub.Close()
 
@@ -64,7 +77,7 @@ func main() {
 	go consumer.RunStatus(ctx, cfg.StatusGroup)
 	go consumer.RunCorrectness(ctx, cfg.CorrectnessGroup)
 
-	w := worker.New(st, redisClient, pub, cfg.LeaderboardKey, log)
+	w := worker.New(st, redisClient, pub, log)
 	for i := 0; i < cfg.Concurrency; i++ {
 		go w.Run(ctx, ready)
 	}

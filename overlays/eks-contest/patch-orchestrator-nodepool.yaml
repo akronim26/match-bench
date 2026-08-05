@@ -1,0 +1,23 @@
+# Pin contestant slots to the sandbox node pool (2026-08-03). slot.go has
+# always supported this (nodePool = "" means NO nodeSelector/toleration), but
+# SANDBOX_NODE_POOL was never set — so on EKS the algo pods landed on GENERAL
+# nodes: the contestant ran beside Postgres/Kafka/validator, a second slot
+# could not schedule at all (general nodes out of CPU, sandbox nodes tainted
+# and untolerated), and the capture never co-located, leaving every session
+# stuck in `deploying` until the deploy deadline fired.
+# Invisible on local k3s: one untainted node, so pinning was a no-op there and
+# the entire isolation model (taints + pool labels + capture co-location) had
+# never actually been exercised.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-orchestrator
+  namespace: sandbox
+spec:
+  template:
+    spec:
+      containers:
+        - name: sandbox-orchestrator
+          env:
+            - name: SANDBOX_NODE_POOL
+              value: sandbox

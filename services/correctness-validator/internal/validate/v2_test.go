@@ -38,12 +38,15 @@ func TestTimePriorityViolationFlagged(t *testing.T) {
 		ordWithFlow("B1", model.NewLimit, model.Buy, 100, 5, fa, 3, 30, fill(5, 100)),
 	}
 	ordered = replay.Order(ordered)
-	r := Run(ordered, nil)
+	r := runStream(ordered, nil)
 	if r.TimeViolations != 1 {
 		t.Fatalf("expected 1 time-priority violation, got %+v", r)
 	}
-	if r.Violations[0].Type != Time {
-		t.Fatalf("expected Time violation type, got %v (%+v)", r.Violations[0].Type, r.Violations)
+	// The report also carries S1's missed_fill — it is the victim of this very jump, and
+	// under-reporting is itself a violation now — so assert on the CLASS being present
+	// rather than on a position in the examples slice.
+	if violationsOfType(r, Time) != 1 {
+		t.Fatalf("expected a Time violation entry, got %+v", r.Violations)
 	}
 }
 
@@ -57,7 +60,7 @@ func TestTimePriorityCleanNotFlagged(t *testing.T) {
 		ordWithFlow("B1", model.NewLimit, model.Buy, 100, 5, fa, 3, 30, fill(5, 100)),
 	}
 	ordered = replay.Order(ordered)
-	r := Run(ordered, nil)
+	r := runStream(ordered, nil)
 	if r.TimeViolations != 0 {
 		t.Fatalf("clean FIFO must not flag a time violation, got %+v", r)
 	}
@@ -66,11 +69,14 @@ func TestTimePriorityCleanNotFlagged(t *testing.T) {
 // TestSelfTradeViolationFlagged performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
 func TestSelfTradeViolationFlagged(t *testing.T) {
+	// Both sides carry the SAME SMP id, which is what makes this a self-trade. The
+	// shared task id in the order ids is irrelevant now: keying on that was the bug
+	// that made every pass-1 fill look like a self-trade, since pass 1 has one task.
 	ordered := []*model.Order{
-		order("sess_7_1_O", model.NewLimit, model.Sell, 100, 10, fill(10, 100)),
-		order("sess_7_2_O", model.NewLimit, model.Buy, 100, 10, fill(10, 100)),
+		orderSMP("sess_7_1_O", model.NewLimit, model.Sell, 100, 10, 4, fill(10, 100)),
+		orderSMP("sess_7_2_O", model.NewLimit, model.Buy, 100, 10, 4, fill(10, 100)),
 	}
-	r := Run(ordered, nil)
+	r := runStream(ordered, nil)
 	if r.SelfTrades == 0 {
 		t.Fatalf("expected a self-trade violation, got %+v", r)
 	}
@@ -92,7 +98,7 @@ func TestSelfTradeCleanNotFlagged(t *testing.T) {
 		order("sess_7_1_O", model.NewLimit, model.Sell, 100, 10, fill(10, 100)),
 		order("sess_9_2_O", model.NewLimit, model.Buy, 100, 10, fill(10, 100)),
 	}
-	r := Run(ordered, nil)
+	r := runStream(ordered, nil)
 	if r.SelfTrades != 0 {
 		t.Fatalf("distinct participants must not be a self-trade, got %+v", r)
 	}
@@ -110,7 +116,7 @@ func TestCancelReplacePriorityLossFlagged(t *testing.T) {
 		ordWithFlow("S1", model.NewLimit, model.Sell, 99, 10, fa, 4, 40, fill(10, 99)),
 	}
 	ordered = replay.Order(ordered)
-	r := Run(ordered, nil)
+	r := runStream(ordered, nil)
 	if r.TimeViolations == 0 {
 		t.Fatalf("expected a cancel-replace priority-loss violation, got %+v", r)
 	}
@@ -137,7 +143,7 @@ func TestCancelReplaceQtyDecreaseKeepsPriority(t *testing.T) {
 	}
 	ordered[2].Flow, ordered[2].TCPSeq, ordered[2].T3Ns = fa, 3, 30
 	ordered = replay.Order(ordered)
-	r := Run(ordered, nil)
+	r := runStream(ordered, nil)
 	if r.TimeViolations != 0 || violationsOfType(r, CancelReplaceLoss) != 0 {
 		t.Fatalf("qty-only decrease keeps priority; must not flag, got %+v", r)
 	}
@@ -154,7 +160,7 @@ func TestCrossFlowTieSuppressesTimeViolation(t *testing.T) {
 		ordWithFlow("B1", model.NewLimit, model.Buy, 100, 5, fa, 2, 2000, fill(5, 100)),
 	}
 	ordered = replay.Order(ordered)
-	r := Run(ordered, nil)
+	r := runStream(ordered, nil)
 	if r.TimeViolations != 0 {
 		t.Fatalf("Δ50ns cross-flow tie must suppress the time violation, got %+v", r)
 	}
@@ -171,7 +177,7 @@ func TestCrossFlowBeyondToleranceFlagsTimeViolation(t *testing.T) {
 		ordWithFlow("B1", model.NewLimit, model.Buy, 100, 5, fa, 2, 2000, fill(5, 100)),
 	}
 	ordered = replay.Order(ordered)
-	r := Run(ordered, nil)
+	r := runStream(ordered, nil)
 	if r.TimeViolations != 1 {
 		t.Fatalf("Δ150ns is beyond tolerance; the time violation must be flagged, got %+v", r)
 	}
@@ -187,7 +193,7 @@ func TestSameFlowStrictNoTolerance(t *testing.T) {
 		ordWithFlow("B1", model.NewLimit, model.Buy, 100, 5, fa, 3, 2000, fill(5, 100)),
 	}
 	ordered = replay.Order(ordered)
-	r := Run(ordered, nil)
+	r := runStream(ordered, nil)
 	if r.TimeViolations != 1 {
 		t.Fatalf("same-flow ordering is strict; a 1ns gap must still flag, got %+v", r)
 	}
@@ -208,21 +214,9 @@ func TestReportDeterministicFullSession(t *testing.T) {
 		}
 		return replay.Order(o)
 	}
-	r1 := Run(build(), []ReportedFill{{OrderID: "ghost", Qty: 1, Price: 50}})
-	r2 := Run(build(), []ReportedFill{{OrderID: "ghost", Qty: 1, Price: 50}})
+	r1 := runStream(build(), []ReportedFill{{OrderID: "ghost", Qty: 1, Price: 50}})
+	r2 := runStream(build(), []ReportedFill{{OrderID: "ghost", Qty: 1, Price: 50}})
 	if !reflect.DeepEqual(r1, r2) {
 		t.Fatalf("CorrectnessReport not deterministic:\n r1=%+v\n r2=%+v", r1, r2)
 	}
-}
-
-// violationsOfType performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func violationsOfType(r Report, vt ViolationType) int {
-	n := 0
-	for _, v := range r.Violations {
-		if v.Type == vt {
-			n++
-		}
-	}
-	return n
 }

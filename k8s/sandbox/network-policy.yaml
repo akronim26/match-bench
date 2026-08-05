@@ -5,6 +5,14 @@
 # aligned with the deployment and operations guidance in the README.
 # Keep comments at the file header so resource bodies stay declarative.
 
+# NOTE (2026-08-03, found on EKS): AWS VPC CNI's network-policy agent does NOT
+# honour `ipBlock: 0.0.0.0/0` for CLUSTER-INTERNAL destinations — egress to the
+# API server ClusterIP (and other in-cluster IPs) is dropped despite the
+# catch-all rule, silently. Every such rule therefore lists the cluster CIDRs
+# EXPLICITLY alongside 0.0.0.0/0: 172.20.0.0/16 (EKS service CIDR), 10.0.0.0/16
+# (VPC/pod CIDR), 10.43.0.0/16 + 10.42.0.0/16 (k3s service/pod CIDRs). This was
+# invisible locally because deploy-local's applynp() skips netpol files
+# entirely, and on the previous EKS cluster because policy enforcement was off.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -21,8 +29,41 @@ spec:
         - namespaceSelector:
             matchLabels:
               name: benchmark
+    # The orchestrator's own readiness probe (2026-08-03, found on EKS). For a
+    # multi-port submission (ProtocolAll: FIX 9898 + HTTP/WS 8080) slot.go
+    # TCP-dials every declared port before reporting the slot ready, and that
+    # dial comes from the orchestrator pod in THIS namespace — which the
+    # benchmark-only rule above denied, so such slots sat in `creating` until
+    # the deploy deadline and never got a capture Job. Single-port submissions
+    # skip the dial entirely, which is why REST-only contestants worked and
+    # ProtocolAll ones did not. Invisible locally: netpols are never applied
+    # there (deploy-local's applynp skips them).
+    - from:
+        - podSelector:
+            matchLabels:
+              app: sandbox-orchestrator
 
   egress:
+    # Responses back to the load generators (2026-08-03, found on EKS). The
+    # catch-all below deliberately EXCLUDES private ranges — which is exactly
+    # where the bot pods live (10.x) — so a contestant could not answer the
+    # bots at all: they stalled with inflight pinned at the cap and
+    # "abandoning stalled peer", and the capture's tc-egress hook never saw a
+    # single response, leaving orders.acked at 0 and no metrics rows. A
+    # contestant must be able to reply to whoever connected to it.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: benchmark
+    # ...and to the orchestrator in THIS namespace, for the same reason: its
+    # readiness dial gets no reply otherwise, so a multi-port slot never
+    # becomes ready. Under the VPC CNI agent every allowed inbound connection
+    # needs its reply path allowed explicitly; the private-range carve-out
+    # below drops both directions of in-cluster traffic.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: sandbox-orchestrator
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0

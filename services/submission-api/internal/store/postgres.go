@@ -476,6 +476,43 @@ func (s *PostgresStore) RecomputeRunGroupStatus(ctx context.Context, runGroupID 
 
 // UpdateRunStatus applies behavior for its receiver performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
+// ClaimNextRunInGroup atomically claims the next undispatched run of a group
+// for sequential-within-group execution (decision 2026-08-02: a 4-scenario
+// run group must hold at most ONE order band at a time, so scenarios dispatch
+// one after another). The earliest `requested` run flips to `queued` and is
+// returned; nil means the group has nothing left to dispatch. Ordering is by
+// session_id: children are UUIDv7s minted in ListScenarios order (sort_order),
+// so id order IS scenario order. The `status='requested'` guard plus
+// FOR UPDATE SKIP LOCKED make concurrent claims (status-topic redelivery,
+// future consumer replicas) safe: each run is dispatched at most once.
+func (s *PostgresStore) ClaimNextRunInGroup(ctx context.Context, runGroupID string) (*RunMeta, error) {
+	start := time.Now()
+	row := s.pool.QueryRow(ctx,
+		`UPDATE runs SET status = 'queued', updated_at = now()
+		  WHERE session_id = (
+		        SELECT session_id FROM runs
+		         WHERE run_group_id = $1 AND status = 'requested'
+		         ORDER BY session_id
+		         LIMIT 1
+		         FOR UPDATE SKIP LOCKED)
+		    AND status = 'requested'
+		 RETURNING session_id, submission_id, contestant_id, run_group_id, scenario_id`,
+		runGroupID,
+	)
+	var m RunMeta
+	err := row.Scan(&m.SessionID, &m.SubmissionID, &m.ContestantID, &m.RunGroupID, &m.ScenarioID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		recordDB("submission-api", "claim_next_run", start, nil)
+		return nil, nil
+	}
+	if err != nil {
+		recordDB("submission-api", "claim_next_run", start, err)
+		return nil, fmt.Errorf("%w: claim next run: %v", cerrs.ErrStoreDatabaseFailed, err)
+	}
+	recordDB("submission-api", "claim_next_run", start, nil)
+	return &m, nil
+}
+
 func (s *PostgresStore) UpdateRunStatus(ctx context.Context, sessionID, status, message string) error {
 	start := time.Now()
 	tag, err := s.pool.Exec(ctx,

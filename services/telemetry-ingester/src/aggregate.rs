@@ -12,6 +12,35 @@ use iicpc_schemas_rust::{OrderAckedEvent, OrderSentEvent};
 
 use crate::join::FirstResponseTracker;
 
+/// SentEventRef is the borrowed view of the fields `observe_sent` actually reads
+/// off an orders.sent event. It lets callers decoding the positional-msgpack V2
+/// wire format (session_id/submission_id/worker_id hoisted into the batch
+/// envelope) pass per-event data without cloning the envelope Strings for every
+/// event in the batch — observe_sent never needed submission_id/worker_id at all.
+pub struct SentEventRef<'a> {
+    pub session_id: &'a str,
+    pub order_id: &'a str,
+    pub target_send_ts_ns: u64,
+    pub send_ts_ns: u64,
+    pub recv_done_ts_ns: u64,
+    pub timed_out: bool,
+    pub barrier_epoch_ns: u64,
+}
+
+impl<'a> From<&'a OrderSentEvent> for SentEventRef<'a> {
+    fn from(e: &'a OrderSentEvent) -> Self {
+        Self {
+            session_id: &e.session_id,
+            order_id: &e.order_id,
+            target_send_ts_ns: e.target_send_ts_ns,
+            send_ts_ns: e.send_ts_ns,
+            recv_done_ts_ns: e.recv_done_ts_ns,
+            timed_out: e.timed_out,
+            barrier_epoch_ns: e.barrier_epoch_ns,
+        }
+    }
+}
+
 pub const DEFAULT_WAVE_NS: u64 = 20_000_000_000;
 const HDR_MAX_NS: u64 = 60_000_000_000;
 const HDR_SIGFIG: u8 = 3;
@@ -186,23 +215,24 @@ impl Aggregator {
 
     /// observe_sent performs the module-specific operation described by its name.
     /// It keeps validation, side effects, and returned values within this module's contract.
-    pub fn observe_sent(&mut self, e: &OrderSentEvent) {
+    pub fn observe_sent<'a>(&mut self, e: impl Into<SentEventRef<'a>>) {
+        let e = e.into();
         if e.barrier_epoch_ns > 0 {
             self.session_start
-                .insert(e.session_id.clone(), e.barrier_epoch_ns);
+                .insert(e.session_id.to_string(), e.barrier_epoch_ns);
         }
         let t0 = e.target_send_ts_ns;
         let t1 = e.send_ts_ns;
         let r9 = e.recv_done_ts_ns;
-        let wave = self.wave_of(&e.session_id, t0);
+        let wave = self.wave_of(e.session_id, t0);
         let contestant = self
             .session_contestant
-            .get(&e.session_id)
+            .get(e.session_id)
             .cloned()
             .unwrap_or_default();
         let w = self
             .windows
-            .entry((e.session_id.clone(), wave))
+            .entry((e.session_id.to_string(), wave))
             .or_insert_with(|| Window::new(contestant, t1.max(t0)));
 
         w.offered += 1;
@@ -211,7 +241,10 @@ impl Aggregator {
             // Mark the order so its (possibly much later) ack is excluded from
             // service_time — the client gave up, so there is no comparable
             // response_time sample. Keyed on the order's own time for eviction.
-            let mark = self.timed_out_orders.entry(e.order_id.clone()).or_insert(0);
+            let mark = self
+                .timed_out_orders
+                .entry(e.order_id.to_string())
+                .or_insert(0);
             *mark = (*mark).max(t1.max(t0));
         }
         if t1 >= t0 {
@@ -367,7 +400,7 @@ pub fn serialize_hist(hist: &Histogram<u64>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iicpc_schemas_rust::{OrdType, PayloadType, Side};
+    use iicpc_schemas_rust::{OrdType, PayloadType, Side, SMP_ID_NONE};
 
     /// acked performs the module-specific operation described by its name.
     /// It keeps validation, side effects, and returned values within this module's contract.
@@ -443,6 +476,10 @@ mod tests {
             ord_type: OrdType::Limit,
             orig_order_id: String::new(),
             barrier_epoch_ns: 0,
+            // Explicitly SMP_ID_NONE, never a bare 0: zero is a VALID participant id as well
+            // as Rust's default, so a synthetic event that omits this reads as "participant
+            // 0" and self-crosses against every other order carrying that id.
+            smp_id: SMP_ID_NONE,
         }
     }
 

@@ -21,17 +21,16 @@ import (
 // Worker groups the state and dependencies used by this package.
 // Keep this type aligned with the runtime contract around it.
 type Worker struct {
-	store          *store.Store
-	redis          *redis.Client
-	publisher      *publisher.Publisher
-	leaderboardKey string
-	log            *slog.Logger
+	store     *store.Store
+	redis     *redis.Client
+	publisher *publisher.Publisher
+	log       *slog.Logger
 }
 
 // New performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func New(st *store.Store, redisClient *redis.Client, pub *publisher.Publisher, leaderboardKey string, log *slog.Logger) *Worker {
-	return &Worker{store: st, redis: redisClient, publisher: pub, leaderboardKey: leaderboardKey, log: log}
+func New(st *store.Store, redisClient *redis.Client, pub *publisher.Publisher, log *slog.Logger) *Worker {
+	return &Worker{store: st, redis: redisClient, publisher: pub, log: log}
 }
 
 // Run applies behavior for its receiver performs the package-specific operation described by its name.

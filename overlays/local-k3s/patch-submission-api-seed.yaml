@@ -1,0 +1,18 @@
+# Local scenario seed: the pass-1 gate + one small pass-2 scenario — what the
+# b1/b2 harnesses expect. SeedScenarios upserts only, so stale extra rows
+# (correctness60, throwaways) must be dropped once via SQL.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: submission-api
+  namespace: platform
+spec:
+  template:
+    spec:
+      containers:
+        - name: submission-api
+          env:
+            - name: SEED_SCENARIOS
+              value: "correctness,constant"
+            - name: RESEED_SCENARIOS
+              value: "true"

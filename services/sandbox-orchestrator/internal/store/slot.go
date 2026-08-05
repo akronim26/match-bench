@@ -24,7 +24,8 @@ const (
 type Slot struct {
 	SlotID    string
 	Image     string
-	Port      int
+	Port      int   // primary (first declared) port; kept for back-compat callers
+	Ports     []int // every declared port; len 1 for single-port slots
 	State     SlotState
 	Message   string // human-readable reason for the current state
 	Endpoint  Endpoint

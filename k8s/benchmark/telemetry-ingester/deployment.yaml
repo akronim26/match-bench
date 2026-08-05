@@ -13,7 +13,12 @@ metadata:
 spec:
   replicas: 2
   strategy:
-    type: Recreate
+    # RollingUpdate is what has ALWAYS run: this block briefly held a duplicate
+    # `type:` key (Recreate above RollingUpdate) and lenient YAML parsers took
+    # the last value, so the Recreate edit was silently dead. The strict
+    # kustomize renderer caught it (2026-08-02). If Recreate is ever wanted
+    # (avoid two generations sharing the consumer group mid-rollout), change
+    # it deliberately — with the lag spike that entails.
     type: RollingUpdate
   selector:
     matchLabels:

@@ -34,14 +34,18 @@ const FIX_PORT: u16 = 9898;
 const HTTP_WS_PORT: u16 = 8080;
 
 #[cfg(target_arch = "bpf")]
-const CAPTURE_CAP: usize = 1536;
-// Maximum payload bytes copied per packet into the capture buffer. The length passed to
-// bpf_*_load_bytes must satisfy the kernel 6.1 BPF verifier (EKS AL2023), whose ARG_CONST_SIZE
-// length arg requires the register to carry umin ≥ 1 (else a zero-size probe fails with "R3 min
-// value is outside of the allowed memory range") AND umax ≤ value_size - payload_off. See
-// capture_len for how those bounds are established (read_volatile + relational guards) and why
-// oversized payloads are clamped to this constant rather than skipped/masked. COPY_CAP ==
-// CAPTURE_CAP ⇒ off 28 + 1536 = 1564 ≤ 1568 value_size.
+const CAPTURE_CAP: usize = 9029;
+// Maximum payload bytes copied per packet into the capture buffer. 9029 = 9001 + 28 covers a
+// full jumbo frame, so EKS keeps MTU 9001 and the platform-wide MTU-1500 clamp (and its ~6x
+// packet-count tax) is no longer forced by the capture — see docs/capture-ringbuf-drops.md
+// §6.2. The per-CPU scratch value is 28 + 9029 = 9057, well under the 32KB PCPU_MIN_UNIT_SIZE
+// bound on per-CPU map values. The length passed to bpf_*_load_bytes must satisfy the kernel
+// 6.1 BPF verifier (EKS AL2023), whose ARG_CONST_SIZE length arg requires the register to
+// carry umin ≥ 1 (else a zero-size probe fails with "R3 min value is outside of the allowed
+// memory range") AND umax ≤ value_size - payload_off. See capture_len for how those bounds are
+// established (read_volatile + relational guards) and why oversized payloads are clamped to
+// this constant rather than skipped/masked. The proof shape is structural — none of it
+// references the constant's value, only COPY_CAP == CAPTURE_CAP == the payload array length.
 #[cfg(target_arch = "bpf")]
 const COPY_CAP: usize = CAPTURE_CAP;
 // Minimum payload length we capture. Must be ≥ 2 so the `len < MIN_CAPTURE_LEN` guard in
@@ -132,7 +136,14 @@ struct PacketBounds {
 
 #[cfg(target_arch = "bpf")]
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024 * 1024, 0);
+// 256MB (was 64): survivable-starvation window. 64MB ≈ 43ms of headroom at
+// 1M max-size records/s against a 5ms drain cadence — ample while userspace
+// runs, but the one observed drop cause is the drain NOT running (host CPU
+// starvation, docs/capture-ringbuf-drops.md §5b), and 4x the ring is 4x the
+// outage the capture can absorb without loss. BPF map memory is memcg-charged
+// to the pod since kernel 5.11, so this moves in lockstep with the capture
+// pod's memory limit (slot.go captureResources, 2Gi).
+static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024 * 1024, 0);
 
 #[cfg(target_arch = "bpf")]
 #[map]
@@ -145,6 +156,39 @@ static DROPPED_EVENTS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 #[cfg(target_arch = "bpf")]
 #[map]
 static TRUNCATED_CAPTURES: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+// Funnel counters. Everything below used to fail silently: a packet that reached the
+// hook and then failed to copy simply vanished, with no counter anywhere, which is how a
+// ~0.2% request-side loss stayed unexplained through four rounds of diagnosis.
+/// Payload-bearing packets the ingress hook accepted for capture (pre-copy).
+#[cfg(target_arch = "bpf")]
+#[map]
+static XDP_PACKETS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+/// Payload-bearing packets the egress hook accepted for capture (pre-copy).
+#[cfg(target_arch = "bpf")]
+#[map]
+static TC_PACKETS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+/// bpf_xdp_load_bytes returned non-zero — the packet is dropped with no record emitted.
+/// Non-linear / multi-buffer skbs are the usual cause.
+#[cfg(target_arch = "bpf")]
+#[map]
+static XDP_LOAD_FAILED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+/// bpf_skb_load_bytes returned non-zero — same, on the response side.
+#[cfg(target_arch = "bpf")]
+#[map]
+static TC_LOAD_FAILED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+/// Payloads shorter than MIN_CAPTURE_LEN, skipped by capture_len.
+#[cfg(target_arch = "bpf")]
+#[map]
+static SHORT_PAYLOAD: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+#[cfg(target_arch = "bpf")]
+#[inline(always)]
+fn bump(m: &PerCpuArray<u64>) {
+    if let Some(c) = m.get_ptr_mut(0) {
+        unsafe { ptr::write(c, ptr::read(c).saturating_add(1)) };
+    }
+}
 
 /// capture_len returns the number of payload bytes to copy into the capture buffer, or None
 /// to skip this packet. It bounds the result to [MIN_CAPTURE_LEN, COPY_CAP] in a form the
@@ -180,6 +224,7 @@ static TRUNCATED_CAPTURES: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0
 fn capture_len(bounds: &PacketBounds) -> Option<usize> {
     let len = unsafe { ptr::read_volatile(&bounds.payload_len) };
     if len < MIN_CAPTURE_LEN {
+        bump(&SHORT_PAYLOAD);
         return None;
     }
     if len > COPY_CAP {
@@ -220,6 +265,7 @@ fn try_xdp_ingress(ctx: &XdpContext) {
     let Some(bounds) = xdp_payload_bounds(data, data_end) else {
         return;
     };
+    bump(&XDP_PACKETS);
     let cap = match capture_len(&bounds) {
         Some(cap) => cap,
         None => return,
@@ -230,6 +276,7 @@ fn try_xdp_ingress(ctx: &XdpContext) {
     let dst = unsafe { ptr::addr_of_mut!((*rec).payload) as *mut c_void };
     let ret = unsafe { bpf_xdp_load_bytes(ctx.ctx, bounds.payload_offset as u32, dst, cap as u32) };
     if ret != 0 {
+        bump(&XDP_LOAD_FAILED);
         return;
     }
     emit_capture(rec, &bounds, cap, DIR_REQUEST);
@@ -243,6 +290,7 @@ fn try_tc_egress(ctx: TcContext) {
     let Some(bounds) = tc_payload_bounds(&ctx) else {
         return;
     };
+    bump(&TC_PACKETS);
     let cap = match capture_len(&bounds) {
         Some(cap) => cap,
         None => return,
@@ -260,6 +308,7 @@ fn try_tc_egress(ctx: TcContext) {
         )
     };
     if ret != 0 {
+        bump(&TC_LOAD_FAILED);
         return;
     }
     emit_capture(rec, &bounds, cap, DIR_RESPONSE);

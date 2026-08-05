@@ -19,6 +19,7 @@ import (
 	"github.com/iicpc/leaderboard-api/internal/config"
 	"github.com/iicpc/leaderboard-api/internal/consumer"
 	"github.com/iicpc/leaderboard-api/internal/handler"
+	"github.com/iicpc/leaderboard-api/internal/live"
 	"github.com/iicpc/leaderboard-api/internal/read"
 	"github.com/iicpc/leaderboard-api/internal/redis"
 	"github.com/iicpc/leaderboard-api/internal/sse"
@@ -61,6 +62,7 @@ func main() {
 		return reader.Leaderboard(ctx, read.LeaderboardQuery{Limit: 100})
 	})
 	go consumer.New(cfg.KafkaBrokers, cfg.KafkaGroup, broker, log).Run(ctx)
+	go live.New(sessionSourceAdapter{reader}, redisClient, broker, 0, log).Run(ctx)
 
 	h := handler.New(cachedReader, cfg.PrometheusURL)
 	var isReady atomic.Bool
@@ -115,6 +117,24 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+}
+
+// sessionSourceAdapter adapts *read.Store to live.SessionSource, converting the store's
+// result type to the poller-local type it depends on.
+type sessionSourceAdapter struct {
+	reader *read.Store
+}
+
+func (a sessionSourceAdapter) ActiveSessionContestants(ctx context.Context) ([]live.ActiveSessionContestant, error) {
+	rows, err := a.reader.ActiveSessionContestants(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]live.ActiveSessionContestant, len(rows))
+	for i, r := range rows {
+		out[i] = live.ActiveSessionContestant{SessionID: r.SessionID, ContestantID: r.ContestantID}
+	}
+	return out, nil
 }
 
 // chiRoutePattern performs the package-specific operation described by its name.

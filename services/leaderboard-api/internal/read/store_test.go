@@ -6,6 +6,7 @@
 package read
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -147,5 +148,55 @@ func TestIsUndefinedTable(t *testing.T) {
 	}
 	if isUndefinedTable(&pgconn.PgError{Code: "23505"}) {
 		t.Fatal("non-undefined table error was recognized")
+	}
+}
+
+// TestLeaderboardQueriesSelectJitterColumns is a no-Postgres regression check
+// that both the paged Leaderboard() query and the single-row scoreForRunGroup()
+// query select every jitter_* column, in the order LeaderboardRow.Scan expects
+// (there is no sqlmock/pgxmock harness in this package to exercise the scan
+// against a live driver, so this pins the SQL text instead).
+func TestLeaderboardQueriesSelectJitterColumns(t *testing.T) {
+	jitterCols := "jitter_p50_us, jitter_p99_us, jitter_p999_us, jitter_max_us, jitter_inversion_rate"
+	if strings.Count(leaderboardQuerySQL, jitterCols) != 2 {
+		t.Fatalf("expected jitter column list %q to appear twice (inner + outer select) in Leaderboard query", jitterCols)
+	}
+	if strings.Count(scoreForRunGroupQuerySQL, jitterCols) != 2 {
+		t.Fatalf("expected jitter column list %q to appear twice (inner + outer select) in scoreForRunGroup query", jitterCols)
+	}
+}
+
+// TestLeaderboardRowJitterJSONRoundTrip covers the struct-mapping/marshal
+// logic for the new jitter fields on LeaderboardRow: the JSON tags used by
+// the API response must round-trip losslessly, including the zero value
+// (no recorded inversions), matching the CorrectnessScoreEvent convention.
+func TestLeaderboardRowJitterJSONRoundTrip(t *testing.T) {
+	want := LeaderboardRow{
+		RunGroupID:    "rg-1",
+		JitterP50US:   12.5,
+		JitterP99US:   88.25,
+		JitterP999US:  150,
+		JitterMaxUS:   300,
+		JitterInvRate: 0.002,
+	}
+	raw, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got LeaderboardRow
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got != want {
+		t.Fatalf("round-trip mismatch: got %+v, want %+v", got, want)
+	}
+
+	zero := LeaderboardRow{RunGroupID: "rg-2"}
+	raw, err = json.Marshal(zero)
+	if err != nil {
+		t.Fatalf("marshal zero: %v", err)
+	}
+	if !strings.Contains(string(raw), `"jitter_p99_us":0`) {
+		t.Fatalf("zero jitter must be emitted (no omitempty), got %s", raw)
 	}
 }

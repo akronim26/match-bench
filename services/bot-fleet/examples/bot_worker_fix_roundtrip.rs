@@ -60,18 +60,52 @@ struct OrderSentBatchOwned {
     events: Vec<OrderSentEventOwned>,
 }
 
-const FIX_BIND: &str = "127.0.0.1:9876";
+fn fix_bind() -> String {
+    env::var("EXAMPLE_BIND").unwrap_or_else(|_| "127.0.0.1:9876".to_string())
+}
 const SESSION_ID: &str = "roundtrip-session";
 const SUBMISSION_ID: &str = "roundtrip-submission";
-const TARGET_RPS: u32 = 20;
-const DURATION_SECS: u64 = 3;
-const ECHO_LATENCY_MS: u64 = 5;
-const DROP_EVERY: u64 = 4;
+// Defaults preserve the original correctness-roundtrip behavior; env overrides
+// (EXAMPLE_TASKS / EXAMPLE_RPS / EXAMPLE_DURATION_S / EXAMPLE_ECHO_LATENCY_MS /
+// EXAMPLE_DROP_EVERY) turn this into a load/profiling harness. EXAMPLE_BENCH=1
+// skips telemetry collection + assertions (pair with BOT_DISABLE_TELEMETRY=1).
+fn env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+fn target_rps() -> u32 {
+    env_u64("EXAMPLE_RPS", 20) as u32
+}
+fn duration_secs() -> u64 {
+    env_u64("EXAMPLE_DURATION_S", 3)
+}
+fn echo_latency_ms() -> u64 {
+    env_u64("EXAMPLE_ECHO_LATENCY_MS", 5)
+}
+fn drop_every() -> u64 {
+    env_u64("EXAMPLE_DROP_EVERY", 4)
+}
+fn task_count() -> u32 {
+    env_u64("EXAMPLE_TASKS", 1) as u32
+}
+fn bench_mode() -> bool {
+    env::var("EXAMPLE_BENCH").as_deref() == Ok("1")
+}
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-/// main performs the module-specific operation described by its name.
-/// It keeps validation, side effects, and returned values within this module's contract.
-async fn main() -> Result<()> {
+// EXAMPLE_WORKER_THREADS sizes the tokio runtime (default 4) so the task-count
+// sweep can compare 1 process x N threads vs N pinned single-thread processes.
+fn main() -> Result<()> {
+    let threads = env_u64("EXAMPLE_WORKER_THREADS", 4) as usize;
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(threads)
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -86,7 +120,8 @@ async fn main() -> Result<()> {
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_millis();
+        .as_millis() as u64
+        + std::process::id() as u64;
     let workload_topic = format!("test.workload.{suffix}");
     let barrier_topic = format!("test.barrier.{suffix}");
     let ready_topic = format!("test.ready.{suffix}");
@@ -111,8 +146,8 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let echo = spawn_fix_echo_server(FIX_BIND, ECHO_LATENCY_MS, DROP_EVERY).await?;
-    eprintln!("fix echo server up on {FIX_BIND}");
+    let echo = spawn_fix_echo_server(&fix_bind(), echo_latency_ms(), drop_every()).await?;
+    eprintln!("fix echo server up on {}", fix_bind());
 
     let config = Config {
         worker_id: "roundtrip-worker".to_string(),
@@ -127,7 +162,9 @@ async fn main() -> Result<()> {
         telemetry_batch_size: 64,
         telemetry_channel_capacity: 4096,
         max_bots_per_worker: 1000,
-        ..Config::default()
+        // from_env, not default: keeps BOT_MAX_INFLIGHT_PER_TASK / BOT_WRITE_BATCH
+        // overrides working for load runs (explicit fields above still win).
+        ..Config::from_env()
     };
     let worker_handle: JoinHandle<()> = tokio::spawn(async move {
         if let Err(err) = worker::run(config).await {
@@ -139,8 +176,9 @@ async fn main() -> Result<()> {
 
     let barrier_epoch_ns = 0u64;
 
-    let host = FIX_BIND.split(':').next().unwrap().to_string();
-    let port: u16 = FIX_BIND.split(':').nth(1).unwrap().parse().unwrap();
+    let bind = fix_bind();
+    let host = bind.split(':').next().unwrap().to_string();
+    let port: u16 = bind.split(':').nth(1).unwrap().parse().unwrap();
     let spec = WorkloadSpec {
         session_id: SESSION_ID.to_string(),
         submission_id: SUBMISSION_ID.to_string(),
@@ -148,6 +186,7 @@ async fn main() -> Result<()> {
         target_host: host,
         target_port: port,
         protocol: Protocol::Fix,
+        targets: Vec::new(),
         worker_index: 0,
         worker_count: 1,
         global_seed: 42,
@@ -155,16 +194,27 @@ async fn main() -> Result<()> {
         connect_timeout_ms: 2000,
         write_timeout_ms: 500,
         barrier_epoch_ns,
-        tasks: vec![TaskSpec {
-            task_id: 1,
-            profile: BotProfile::Hft,
-            target_rps: TARGET_RPS,
-            start_offset_ns: 0,
-            duration_ns: Duration::from_secs(DURATION_SECS).as_nanos() as u64,
-            market_pct: 0,
-            cancel_pct: 0,
-            replace_pct: 0,
-        }],
+        published_at_unix_ns: 0,
+        order_band: iicpc_schemas_rust::ORDER_BAND_UNSET,
+        tasks: (1..=task_count())
+            .map(|i| TaskSpec {
+                task_id: i,
+                profile: BotProfile::Hft,
+                target_rps: target_rps(),
+                start_offset_ns: 0,
+                duration_ns: Duration::from_secs(duration_secs()).as_nanos() as u64,
+                market_pct: 0,
+                cancel_pct: 0,
+                replace_pct: 0,
+                target_idx: 0,
+                // 0 means this task emits NO self-match-prevention id — no FIX tag 7928 at
+                // all — which keeps the roundtrip frames byte-identical to what this example
+                // asserted before the field existed. Note this is NOT the same convention as
+                // OrderSentEvent::smp_id, where 0 is a valid participant and the "absent"
+                // sentinel is u32::MAX.
+                smp_id_count: 0,
+            })
+            .collect(),
     };
 
     let producer = kafka_helper::producer(&brokers).context("producer")?;
@@ -194,7 +244,24 @@ async fn main() -> Result<()> {
         .context("publish barrier")?;
     eprintln!("ready seen, barrier published (epoch_ns={barrier_epoch_ns})");
 
-    let collect_deadline = Duration::from_secs(2 + DURATION_SECS + 7);
+    if bench_mode() {
+        // Load/profiling mode: no telemetry collection or assertions — just let
+        // the run complete (worker logs per-second send snapshots), then exit.
+        eprintln!(
+            "bench mode: {} tasks x {} rps for {}s (pid {})",
+            task_count(),
+            target_rps(),
+            duration_secs(),
+            std::process::id()
+        );
+        sleep(Duration::from_secs(duration_secs() + 5)).await;
+        echo.abort();
+        worker_handle.abort();
+        eprintln!("== BENCH RUN COMPLETE ==");
+        return Ok(());
+    }
+
+    let collect_deadline = Duration::from_secs(2 + duration_secs() + 7);
     eprintln!(
         "collecting orders.sent for {}s ...",
         collect_deadline.as_secs()
@@ -208,7 +275,7 @@ async fn main() -> Result<()> {
     let _ = worker_handle.await;
     let _ = echo.await;
 
-    let total_expected = TARGET_RPS as u64 * DURATION_SECS;
+    let total_expected = target_rps() as u64 * duration_secs() * task_count() as u64;
     if events.len() < (total_expected as usize) * 9 / 10 {
         return Err(anyhow!(
             "expected ~{} events, got {} (below 90% threshold)",
@@ -263,7 +330,7 @@ async fn main() -> Result<()> {
         order_ids_seen.len()
     );
 
-    let expected_dropped = events.len() as u64 / DROP_EVERY;
+    let expected_dropped = events.len() as u64 / drop_every().max(1);
     let dropped_tolerance = expected_dropped / 4 + 2;
     let dropped_diff = timed_out_count.abs_diff(expected_dropped);
     if dropped_diff > dropped_tolerance {
@@ -281,14 +348,14 @@ async fn main() -> Result<()> {
             "matched latency p50 = {:.2} ms, p99 = {:.2} ms (echo latency target = {} ms)",
             p50 as f64 / 1e6,
             p99 as f64 / 1e6,
-            ECHO_LATENCY_MS
+            echo_latency_ms()
         );
-        let min_acceptable_ns = (ECHO_LATENCY_MS / 2) * 1_000_000;
+        let min_acceptable_ns = (echo_latency_ms() / 2) * 1_000_000;
         if p50 < min_acceptable_ns {
             return Err(anyhow!(
                 "p50 latency {} ns is well below the echo server's artificial latency of {} ms — something is wrong",
                 p50,
-                ECHO_LATENCY_MS
+                echo_latency_ms()
             ));
         }
     }
@@ -337,17 +404,47 @@ async fn create_topics(brokers: &str, topics: &[&str]) -> Result<()> {
     let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .create()?;
+    // RF=1 default so the example runs against a local single-broker Kafka;
+    // set EXAMPLE_TOPIC_RF=3 (with min.insync.replicas=2) on a real cluster.
+    let rf: i32 = env::var("EXAMPLE_TOPIC_RF")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let min_isr = if rf >= 3 { "2" } else { "1" };
     let news: Vec<NewTopic> = topics
         .iter()
         .map(|t| {
-            NewTopic::new(t, 3, TopicReplication::Fixed(3))
-                .set("min.insync.replicas", "2")
+            NewTopic::new(t, 3, TopicReplication::Fixed(rf))
+                .set("min.insync.replicas", min_isr)
                 .set("retention.ms", "86400000")
                 .set("max.message.bytes", "1048576")
         })
         .collect();
-    let _ = admin.create_topics(&news, &AdminOptions::new()).await;
-    Ok(())
+    let results = admin
+        .create_topics(&news, &AdminOptions::new())
+        .await
+        .context("admin create_topics")?;
+    for r in results {
+        if let Err((topic, code)) = r {
+            return Err(anyhow!("create topic {topic} failed: {code}"));
+        }
+    }
+    // Creation is acked by the controller before metadata propagates to brokers;
+    // a consumer subscribing in that window dies on UnknownTopicOrPartition.
+    // Poll metadata until every topic is visible.
+    let probe: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", "topic-probe")
+        .create()?;
+    for _ in 0..50 {
+        let md = probe.fetch_metadata(None, Duration::from_secs(2))?;
+        let visible: HashSet<&str> = md.topics().iter().map(|t| t.name()).collect();
+        if topics.iter().all(|t| visible.contains(t)) {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow!("topics not visible in metadata after 5s"))
 }
 
 /// collect_events performs the module-specific operation described by its name.
@@ -422,6 +519,16 @@ async fn serve_one_fix_connection(
     let mut chunk = [0u8; 4096];
     let mut response_seq: u64 = 1;
     let mut order_count: u64 = 0;
+
+    // EXAMPLE_SINK=drain: pure read-and-discard (no FIX parse, no replies) —
+    // matches the deploy-bench drain contestant used for raw send-capacity runs.
+    if env::var("EXAMPLE_SINK").as_deref() == Ok("drain") {
+        loop {
+            if stream.read(&mut chunk).await? == 0 {
+                return Ok(());
+            }
+        }
+    }
 
     loop {
         let n = stream.read(&mut chunk).await?;

@@ -14,6 +14,7 @@ import type {
   LeaderboardEntry,
   LeaderboardResponse,
   LeaderboardUpdateEvent,
+  LiveMetricsEvent,
   SSEEvent,
 } from "@/types/leaderboard";
 import { useSSE, type SSEStatus } from "./useSSE";
@@ -26,7 +27,15 @@ export function applyLeaderboardUpdate(
   current: LeaderboardResponse,
   update: LeaderboardUpdateEvent,
 ): LeaderboardResponse {
+  const matches = (row: LeaderboardEntry) =>
+    row.run_group_id === update.run_group_id &&
+    row.contestant_id === update.contestant_id;
+  const existing = current.rows.find(matches);
+  // LeaderboardUpdateEvent (the SSE "update" payload) doesn't carry jitter_p99_us
+  // — that only comes from the initial REST snapshot — so preserve it from the
+  // matched row rather than dropping it on every live update.
   const entry: LeaderboardEntry = {
+    ...existing,
     rank: update.rank,
     run_group_id: update.run_group_id,
     submission_id: update.submission_id,
@@ -41,10 +50,7 @@ export function applyLeaderboardUpdate(
     rank_delta: update.rank_delta,
     computed_at_ns: update.updated_at_ns,
   };
-  const matches = (row: LeaderboardEntry) =>
-    row.run_group_id === update.run_group_id &&
-    row.contestant_id === update.contestant_id;
-  const rows = current.rows.some(matches)
+  const rows = existing
     ? current.rows.map((row) => (matches(row) ? entry : row))
     : [...current.rows, entry];
   return { ...current, rows };
@@ -58,6 +64,9 @@ export function useLeaderboard(scenario?: string) {
   const queryClient = useQueryClient();
   const [sseStatus, setSseStatus] = useState<SSEStatus>("closed");
   const [flashedRows, setFlashedRows] = useState<Set<string>>(new Set());
+  const [liveMetrics, setLiveMetrics] = useState<
+    Record<string, LiveMetricsEvent>
+  >({});
 
   const query = useQuery<LeaderboardResponse, ApiError>({
     queryKey: ["leaderboard", scenario ?? "all"],
@@ -92,6 +101,13 @@ export function useLeaderboard(scenario?: string) {
         );
         flash(event.data.contestant_id);
       }
+      if (event.type === "live_metrics") {
+        const metricsKey = `${event.data.session_id}:${event.data.contestant_id}`;
+        setLiveMetrics((current) => ({
+          ...current,
+          [metricsKey]: event.data,
+        }));
+      }
     },
     [flash, queryClient, key],
   );
@@ -108,5 +124,6 @@ export function useLeaderboard(scenario?: string) {
     error: query.error,
     sseStatus,
     flashedRows,
+    liveMetrics,
   };
 }

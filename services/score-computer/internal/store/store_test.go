@@ -69,3 +69,36 @@ func TestCreateTableSQLTelemetryCompletenessSchema(t *testing.T) {
 		t.Error("scoring_config seed does not include the 0.90 min_coverage default")
 	}
 }
+
+// TestCreateTableSQLJitterSchema verifies the jitter columns are present on
+// both score_progress (nullable, populated per-session by RecordCorrectness)
+// and scores (NOT NULL DEFAULT 0, populated per-run-group by SaveScore), and
+// that both are added via idempotent migrations so pre-existing tables
+// upgrade cleanly.
+func TestCreateTableSQLJitterSchema(t *testing.T) {
+	jitterCols := []string{"jitter_p50_us", "jitter_p99_us", "jitter_p999_us", "jitter_max_us", "jitter_inversion_rate"}
+
+	scoreProgressIdx := strings.Index(createTableSQL, "CREATE TABLE IF NOT EXISTS score_progress")
+	scoringConfigIdx := strings.Index(createTableSQL, "CREATE TABLE IF NOT EXISTS scoring_config")
+	scoresIdx := strings.Index(createTableSQL, "CREATE TABLE IF NOT EXISTS scores")
+	if scoreProgressIdx == -1 || scoringConfigIdx == -1 || scoresIdx == -1 {
+		t.Fatal("expected all three tables in createTableSQL")
+	}
+	scoreProgressBlock := createTableSQL[scoreProgressIdx:scoringConfigIdx]
+	scoresBlock := createTableSQL[scoresIdx:]
+
+	for _, col := range jitterCols {
+		if !strings.Contains(scoreProgressBlock, col+" ") {
+			t.Errorf("score_progress table definition missing column %q", col)
+		}
+		if !strings.Contains(scoreProgressBlock, "ADD COLUMN IF NOT EXISTS "+col+" DOUBLE PRECISION;") {
+			t.Errorf("score_progress missing idempotent migration for %q", col)
+		}
+		if !strings.Contains(scoresBlock, col+" ") {
+			t.Errorf("scores table definition missing column %q", col)
+		}
+		if !strings.Contains(scoresBlock, "ADD COLUMN IF NOT EXISTS "+col+" DOUBLE PRECISION NOT NULL DEFAULT 0;") {
+			t.Errorf("scores missing idempotent migration for %q with DEFAULT 0", col)
+		}
+	}
+}

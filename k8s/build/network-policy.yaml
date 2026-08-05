@@ -5,6 +5,14 @@
 # aligned with the deployment and operations guidance in the README.
 # Keep comments at the file header so resource bodies stay declarative.
 
+# NOTE (2026-08-03, found on EKS): AWS VPC CNI's network-policy agent does NOT
+# honour `ipBlock: 0.0.0.0/0` for CLUSTER-INTERNAL destinations — egress to the
+# API server ClusterIP (and other in-cluster IPs) is dropped despite the
+# catch-all rule, silently. Every such rule therefore lists the cluster CIDRs
+# EXPLICITLY alongside 0.0.0.0/0: 172.20.0.0/16 (EKS service CIDR), 10.0.0.0/16
+# (VPC/pod CIDR), 10.43.0.0/16 + 10.42.0.0/16 (k3s service/pod CIDRs). This was
+# invisible locally because deploy-local's applynp() skips netpol files
+# entirely, and on the previous EKS cluster because policy enforcement was off.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -31,6 +39,9 @@ spec:
 
     # 443 for ECR pull/push + HTTPS package mirrors; 80 for apt (deb.debian.org is HTTP) in
     # the generated Dockerfile's runtime stage (ca-certificates install).
+    # NOT extended with cluster CIDRs (unlike the API-server rules elsewhere):
+    # build jobs must reach the internet (ECR, apt) and explicitly NOT the
+    # cluster's internal networks — that is what the except list is for.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
@@ -112,6 +123,14 @@ spec:
               - 10.0.0.0/8
               - 172.16.0.0/12
               - 192.168.0.0/16
+        - ipBlock:
+            cidr: 172.20.0.0/16
+        - ipBlock:
+            cidr: 10.0.0.0/16
+        - ipBlock:
+            cidr: 10.43.0.0/16
+        - ipBlock:
+            cidr: 10.42.0.0/16
       ports:
         - port: 443
           protocol: TCP

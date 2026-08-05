@@ -148,8 +148,160 @@ func TestConfig_Validation(t *testing.T) {
 	}
 }
 
+// TestConfig_ValidationRejectsMixNotSummingTo100 performs the package-specific
+// operation described by its name. It protects QoL-6: the lifted population mix
+// must still sum to 100, matching the pre-lift hardcoded 60/25/15 invariant.
+func TestConfig_ValidationRejectsMixNotSummingTo100(t *testing.T) {
+	c := DefaultConfig()
+	c.MixHFTPct = 60
+	c.MixRetailPct = 25
+	c.MixInstitutionalPct = 10 // sums to 95, not 100
+
+	if _, err := BuildAll(c); err == nil {
+		t.Fatal("expected validation error for a mix that does not sum to 100")
+	}
+}
+
+// TestConfig_ValidationRejectsActionPctOver100 guards the lifted per-profile
+// action mixes (QoL-6): each must stay within 0-100.
+func TestConfig_ValidationRejectsActionPctOver100(t *testing.T) {
+	c := DefaultConfig()
+	c.HFTMarketPct = 101
+
+	if _, err := BuildAll(c); err == nil {
+		t.Fatal("expected validation error for an action pct over 100")
+	}
+}
+
+// TestConfig_MixOverrideChangesTaskActionMix verifies overriding the lifted
+// Config fields actually reaches the emitted TaskSpecs (QoL-6's whole point: the
+// per-protocol budget split edits these same call sites).
+func TestConfig_MixOverrideChangesTaskActionMix(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.HFTMarketPct = 77
+	cfg.HFTCancelPct = 3
+	cfg.HFTReplacePct = 1
+
+	rows, err := BuildAll(cfg)
+	if err != nil {
+		t.Fatalf("BuildAll: %v", err)
+	}
+	c := find(t, rows, "constant")
+	found := false
+	for _, ts := range c.TaskSpecs {
+		if ts.Profile != "hft" {
+			continue
+		}
+		found = true
+		if ts.MarketPct != 77 || ts.CancelPct != 3 || ts.ReplacePct != 1 {
+			t.Fatalf("hft task action mix = %d/%d/%d, want 77/3/1", ts.MarketPct, ts.CancelPct, ts.ReplacePct)
+		}
+	}
+	if !found {
+		t.Fatal("expected at least one hft task at the default constant RPS budget")
+	}
+}
+
+// TestConfig_MixOverrideChangesPopulationSplit verifies the lifted MixHFTPct etc.
+// actually drive botCountsForBudget, not just decorative fields.
+func TestConfig_MixOverrideChangesPopulationSplit(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MixHFTPct = 100
+	cfg.MixRetailPct = 0
+	cfg.MixInstitutionalPct = 0
+
+	rows, err := BuildAll(cfg)
+	if err != nil {
+		t.Fatalf("BuildAll: %v", err)
+	}
+	c := find(t, rows, "constant")
+	for _, ts := range c.TaskSpecs {
+		if ts.Profile != "hft" {
+			t.Fatalf("expected only hft tasks at mix=100/0/0, found %q", ts.Profile)
+		}
+	}
+}
+
+// TestConfigFromEnv_ReadsMixAndActionPcts covers the env-var wiring QoL-6 adds
+// alongside the existing RPS knobs.
+func TestConfigFromEnv_ReadsMixAndActionPcts(t *testing.T) {
+	t.Setenv("MIX_HFT_PCT", "50")
+	t.Setenv("MIX_RETAIL_PCT", "30")
+	t.Setenv("MIX_INSTITUTIONAL_PCT", "20")
+	t.Setenv("HFT_MARKET_PCT", "9")
+	t.Setenv("RETAIL_REPLACE_PCT", "0")
+	t.Setenv("INSTITUTIONAL_CANCEL_PCT", "12")
+
+	cfg := ConfigFromEnv()
+	if cfg.MixHFTPct != 50 || cfg.MixRetailPct != 30 || cfg.MixInstitutionalPct != 20 {
+		t.Fatalf("mix = %d/%d/%d, want 50/30/20", cfg.MixHFTPct, cfg.MixRetailPct, cfg.MixInstitutionalPct)
+	}
+	if cfg.HFTMarketPct != 9 {
+		t.Fatalf("HFTMarketPct = %d, want 9", cfg.HFTMarketPct)
+	}
+	if cfg.RetailReplacePct != 0 {
+		t.Fatalf("RetailReplacePct = %d, want 0 (explicit env override, not the fallback default)", cfg.RetailReplacePct)
+	}
+	if cfg.InstitutionalCancelPct != 12 {
+		t.Fatalf("InstitutionalCancelPct = %d, want 12", cfg.InstitutionalCancelPct)
+	}
+}
+
+// TestConfigFromEnv_UnsetMixFallsBackToDefaults ensures ConfigFromEnv without any
+// of the new env vars reproduces the pre-lift hardcoded 60/25/15 population mix.
+func TestConfigFromEnv_UnsetMixFallsBackToDefaults(t *testing.T) {
+	cfg := ConfigFromEnv()
+	def := DefaultConfig()
+	if cfg.MixHFTPct != def.MixHFTPct || cfg.MixRetailPct != def.MixRetailPct || cfg.MixInstitutionalPct != def.MixInstitutionalPct {
+		t.Fatalf("mix = %d/%d/%d, want defaults %d/%d/%d",
+			cfg.MixHFTPct, cfg.MixRetailPct, cfg.MixInstitutionalPct,
+			def.MixHFTPct, def.MixRetailPct, def.MixInstitutionalPct)
+	}
+}
+
 // find performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
+func TestCorrectnessScenario_SingleMaxRateTask(t *testing.T) {
+	cfg := DefaultConfig()
+	rows, err := BuildAll(cfg)
+	if err != nil {
+		t.Fatalf("BuildAll: %v", err)
+	}
+	c := find(t, rows, "correctness")
+
+	if len(c.TaskSpecs) != 1 {
+		t.Fatalf("expected exactly 1 task, got %d", len(c.TaskSpecs))
+	}
+	task := c.TaskSpecs[0]
+	if task.TargetRPS != 0 {
+		t.Errorf("expected TargetRPS=0 (max-rate sentinel), got %d", task.TargetRPS)
+	}
+	if task.Profile != "hft" {
+		t.Errorf("expected hft profile, got %q", task.Profile)
+	}
+	if c.DurationNs != uint64(cfg.CorrectnessDuration.Nanoseconds()) {
+		t.Errorf("DurationNs = %d, want %d", c.DurationNs, cfg.CorrectnessDuration.Nanoseconds())
+	}
+	if task.MarketPct != cfg.HFTMarketPct || task.CancelPct != cfg.HFTCancelPct || task.ReplacePct != cfg.HFTReplacePct {
+		t.Errorf("correctness task action mix should match HFT mix, got %+v", task)
+	}
+}
+
+func TestCorrectnessScenario_DurationFromEnv(t *testing.T) {
+	t.Setenv("CORRECTNESS_DURATION_S", "90")
+	cfg := ConfigFromEnv()
+	if cfg.CorrectnessDuration != 90*time.Second {
+		t.Fatalf("expected 90s from env, got %v", cfg.CorrectnessDuration)
+	}
+}
+
+func TestCorrectnessScenario_DefaultDuration(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.CorrectnessDuration != 45*time.Second {
+		t.Fatalf("expected default 45s, got %v", cfg.CorrectnessDuration)
+	}
+}
+
 func find(t *testing.T, rows []ScenarioRow, name string) ScenarioRow {
 	t.Helper()
 	for _, r := range rows {
@@ -159,4 +311,37 @@ func find(t *testing.T, rows []ScenarioRow, name string) ScenarioRow {
 	}
 	t.Fatalf("scenario %q not found", name)
 	return ScenarioRow{}
+}
+
+// TestCorrectnessScenarioSeedsSMPIDs pins the seeding that makes pass 1 scoreable at
+// all. Without rotating SMP ids, the correctness scenario's single task gives every
+// order one participant identity, the reference book flags every fill as a self-trade,
+// and a CORRECT engine scores 0 while one that refuses to trade scores 1.0.
+func TestCorrectnessScenarioSeedsSMPIDs(t *testing.T) {
+	rows, err := BuildAll(DefaultConfig())
+	if err != nil {
+		t.Fatalf("BuildAll: %v", err)
+	}
+	c := find(t, rows, "correctness")
+	if len(c.TaskSpecs) != 1 {
+		t.Fatalf("correctness must stay a single task (one connection => total TCPSeq order), got %d", len(c.TaskSpecs))
+	}
+	if got := c.TaskSpecs[0].SMPIDCount; got < 2 {
+		t.Errorf("correctness SMPIDCount = %d; must be >= 2 or every match is a self-match", got)
+	}
+	if got := c.TaskSpecs[0].SMPIDCount; got != correctnessSMPIDCount {
+		t.Errorf("correctness SMPIDCount = %d, want %d", got, correctnessSMPIDCount)
+	}
+
+	// Scale scenarios must NOT carry SMP ids: SMP is not graded in pass 2, and omitting
+	// the field keeps their wire frames byte-identical to pre-SMP output.
+	for _, name := range []string{"constant", "spike", "ramp"} {
+		s := find(t, rows, name)
+		for i, ts := range s.TaskSpecs {
+			if ts.SMPIDCount != 0 {
+				t.Errorf("%s task %d SMPIDCount = %d, want 0", name, i, ts.SMPIDCount)
+				break
+			}
+		}
+	}
 }

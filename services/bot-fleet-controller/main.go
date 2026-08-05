@@ -74,10 +74,49 @@ func main() {
 		os.Exit(1)
 	}
 
+	partitionCtx, partitionCancel := context.WithTimeout(ctx, 30*time.Second)
+	workloadPartitions, err := producer.WorkloadPartitionCount(partitionCtx)
+	partitionCancel()
+	if err != nil {
+		log.Error("read workload.assignments partition count failed", "error", err)
+		os.Exit(1)
+	}
+	leases := controller.NewPartitionLeaseAllocator(workloadPartitions)
+
+	// Order bands are leased 1:1 with MAX_CONCURRENT_SESSIONS, so this MUST NOT exceed
+	// the number of DISTINCT bands the partition count yields:
+	//
+	//     MAX_CONCURRENT_SESSIONS <= floor(orders_partitions / band_width)
+	//
+	// At the shipped 24 partitions and DEFAULT_PARTITION_BAND_WIDTH=6 that is
+	// floor(24/6) = 4 EXCLUSIVE 6-partition bands (0-5, 6-11, 12-17, 18-23), one per
+	// concurrently-running session.
+	//
+	// The invariant was violated while band_width was 8: floor(24/8) = 3 bands against
+	// 4 leased sessions, so band 3's base = 3*8 = 24 wrapped modulo 24 back onto band
+	// 0's partitions. Producer and consumer agreed on the wraparound, so traffic stayed
+	// consistent but NOT exclusive — two sessions shared partitions and band-scoped
+	// validation isolation silently stopped holding at the 4th session.
+	//
+	// Raising this ceiling means changing the arithmetic, not just this number: widen
+	// orders.* beyond 24 partitions, or narrow band_width further.
+	maxConcurrentSessions := envOrInt("MAX_CONCURRENT_SESSIONS", 4)
+	bandLeases := controller.NewBandLeaseAllocator(maxConcurrentSessions)
+
 	orchClient := orchestrator.NewClient(orchURL)
 	sessions := controller.NewSessionManager()
-	runner := controller.NewRunner(sessions, st, orchClient, producer, runConfig, log)
-	consumer := controller.NewConsumer(kafkaBrokers, benchmarkGroup, botReadyGroup, runner, sessions, log)
+	runner := controller.NewRunner(sessions, st, orchClient, producer, leases, bandLeases, runConfig, log)
+	// The pre-scale gate reads the WORKER's consumer group (bot-fleet), not either of
+	// the controller's own groups above: its members are the consumers that can receive
+	// a workload spec. Must match KAFKA_CONSUMER_GROUP on the bot-fleet Deployment.
+	if runConfig.CapacityWaitTimeout > 0 {
+		workerGroup := envOr("KAFKA_WORKER_GROUP", "bot-fleet")
+		runner.SetCapacityProbe(producer.GroupCapacityProbe(workerGroup))
+		log.Info("pre-scale gate enabled",
+			"worker_group", workerGroup,
+			"timeout", runConfig.CapacityWaitTimeout.String())
+	}
+	consumer := controller.NewConsumerWithConcurrency(kafkaBrokers, benchmarkGroup, botReadyGroup, runner, producer, sessions, log, maxConcurrentSessions)
 	defer consumer.Close()
 
 	go consumer.StartBenchmarkRequested(ctx)
@@ -120,6 +159,15 @@ func main() {
 
 	<-ctx.Done()
 	log.Info("shutting down")
+	// Join in-flight session goroutines before the deferred producer/consumer
+	// Close runs: each session's ctx.Done path publishes a failure status and
+	// deletes its sandbox slot on detached contexts — without this join those
+	// calls race process exit and lose (orphaned contestant pods, runs stuck
+	// non-terminal with no redelivery). 15s stays inside the default 30s k8s
+	// termination grace period.
+	if !consumer.WaitSessions(15 * time.Second) {
+		log.Error("shutdown: in-flight sessions did not finish within 15s; their cleanup may be incomplete")
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -151,6 +199,21 @@ func runConfigFromEnv() controller.RunConfig {
 		BarrierSafetyGap: envOrDuration("BARRIER_SAFETY_GAP", 500*time.Millisecond),
 
 		MaxTasksPerWorker: envOrInt("MAX_TASKS_PER_WORKER", controller.DefaultMaxTasksPerWorker),
+		// WORKER_RPS_CAPACITY defaults to 0 = throughput ceiling OFF, preserving the
+		// task-count-only sharding this service shipped with. Deployments set it to
+		// their MEASURED single-worker send ceiling; there is no safe universal
+		// default (~50k/s local loopback vs 600-790k/s drain on EKS).
+		WorkerRPSCapacity: uint64(envOrInt("WORKER_RPS_CAPACITY", 0)),
+
+		// Pre-scale gate. 0 disables it. The default allows for KEDA's polling
+		// interval plus a pod schedule, image pull and Kafka group join; it is
+		// deliberately shorter than READY_DEADLINE so an under-provisioned fleet is
+		// reported as a capacity shortfall rather than as a confusing partial ready
+		// fan-in later in the run.
+		CapacityWaitTimeout:  envOrDuration("CAPACITY_WAIT_TIMEOUT", 90*time.Second),
+		CapacityPollInterval: envOrDuration("CAPACITY_POLL_INTERVAL", 2*time.Second),
+
+		LeaseAcquireTimeout: envOrDuration("LEASE_ACQUIRE_TIMEOUT", 60*time.Second),
 	}
 }
 

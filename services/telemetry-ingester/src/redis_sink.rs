@@ -6,9 +6,10 @@
 
 use anyhow::{Context, Result};
 use redis::aio::MultiplexedConnection;
-use redis::AsyncCommands;
 
 use crate::aggregate::Snapshot;
+
+const KEY_TTL_SECS: i64 = 3600;
 
 /// RedisSink stores the state passed across this module boundary.
 /// Keep field changes compatible with callers and serialized contracts.
@@ -47,9 +48,41 @@ impl RedisSink {
                 ("session_id", s.session_id.clone()),
                 ("updated_at_ns", s.time_ns.to_string()),
             ];
-            conn.hset_multiple::<_, _, _, ()>(&key, fields)
+            let live_key = live_key(s);
+            let mut pipe = redis::pipe();
+            pipe.hset_multiple(&key, fields)
+                .ignore()
+                .expire(&key, KEY_TTL_SECS)
+                .ignore();
+            pipe.query_async::<()>(&mut conn)
                 .await
-                .context("redis HSET contestant hash")?;
+                .context("redis pipeline HSET/EXPIRE")?;
+
+            // CAS the live pointer on wave_index so out-of-order flushes (HashMap
+            // iteration order, replay after restart/rebalance, or multiple ingester
+            // replicas sharing a session's partition band) cannot regress it to an
+            // older wave. This GET-then-SET is not linearizable across concurrent
+            // writers; it relies on the assumption (per session-band partitioning)
+            // that there is at most one writer for a given session shard, which
+            // makes the race window between GET and SET benign in practice.
+            let current: Option<String> = redis::cmd("GET")
+                .arg(&live_key)
+                .query_async(&mut conn)
+                .await
+                .context("redis GET live pointer")?;
+            let current_wave: i64 = current.and_then(|v| v.parse::<i64>().ok()).unwrap_or(-1);
+            if (s.wave_index as i64) >= current_wave {
+                let mut set_pipe = redis::pipe();
+                set_pipe
+                    .set(&live_key, s.wave_index.to_string())
+                    .ignore()
+                    .expire(&live_key, KEY_TTL_SECS)
+                    .ignore();
+                set_pipe
+                    .query_async::<()>(&mut conn)
+                    .await
+                    .context("redis pipeline SET/EXPIRE live pointer")?;
+            }
         }
         Ok(())
     }
@@ -62,6 +95,10 @@ fn redis_key(s: &Snapshot) -> String {
         "contestant:{}:{}:{}",
         s.contestant_id, s.session_id, s.wave_index
     )
+}
+
+fn live_key(s: &Snapshot) -> String {
+    format!("live:{}:latest", s.session_id)
 }
 
 #[cfg(test)]
@@ -105,6 +142,86 @@ mod tests {
             redis_key(&snap("c1", "S", 0)),
             a,
             "stable for the same window"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_sets_ttl_and_live_pointer() {
+        let Ok(url) = std::env::var("REDIS_URL") else {
+            eprintln!("skip write_sets_ttl_and_live_pointer: REDIS_URL unset");
+            return;
+        };
+        let session = format!("utest-redis-{}", std::process::id());
+        let s = snap("c1", &session, 3);
+        let sink = RedisSink::connect(&url).await.expect("connect redis");
+        sink.write(&[s.clone()]).await.expect("redis write");
+
+        let client = redis::Client::open(url).expect("redis client");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("redis conn");
+
+        let hash_key = redis_key(&s);
+        let hash_ttl: i64 = redis::cmd("TTL")
+            .arg(&hash_key)
+            .query_async(&mut conn)
+            .await
+            .expect("ttl contestant hash");
+        assert!(hash_ttl > 0, "contestant hash key must have a TTL set");
+
+        let live_key = live_key(&s);
+        let live_value: String = redis::cmd("GET")
+            .arg(&live_key)
+            .query_async(&mut conn)
+            .await
+            .expect("get live pointer");
+        assert_eq!(live_value, "3");
+
+        let live_ttl: i64 = redis::cmd("TTL")
+            .arg(&live_key)
+            .query_async(&mut conn)
+            .await
+            .expect("ttl live pointer");
+        assert!(live_ttl > 0, "live pointer key must have a TTL set");
+    }
+
+    #[tokio::test]
+    async fn live_pointer_does_not_regress_on_out_of_order_flush() {
+        let Ok(url) = std::env::var("REDIS_URL") else {
+            eprintln!("skip live_pointer_does_not_regress_on_out_of_order_flush: REDIS_URL unset");
+            return;
+        };
+        let session = format!("utest-redis-cas-{}", std::process::id());
+        let newer = snap("c1", &session, 5);
+        let older = snap("c1", &session, 2);
+        let sink = RedisSink::connect(&url).await.expect("connect redis");
+
+        // Write the newer wave first, then an older wave arrives late (e.g. replay
+        // after restart, or reordering across a rebalance). The live pointer must
+        // stay at the newer wave, not regress.
+        sink.write(&[newer.clone()])
+            .await
+            .expect("redis write newer");
+        sink.write(&[older.clone()])
+            .await
+            .expect("redis write older");
+
+        let client = redis::Client::open(url).expect("redis client");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("redis conn");
+
+        let live_key = live_key(&newer);
+        let live_value: String = redis::cmd("GET")
+            .arg(&live_key)
+            .query_async(&mut conn)
+            .await
+            .expect("get live pointer");
+        assert_eq!(
+            live_value, "5",
+            "live pointer must remain at the newer wave, not regress to an older one"
         );
     }
 }

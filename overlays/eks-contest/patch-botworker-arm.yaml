@@ -1,0 +1,32 @@
+# Graviton 1-pod-per-node bot workers (docs/eks-contest-deployment.md §2):
+# requests 3 CPU of ~3.6 allocatable on c7g.xlarge make a second worker
+# unschedulable, and the required podAntiAffinity states the invariant
+# explicitly. arm64 nodeSelector pins the pool; the bot-fleet image is a
+# multi-arch manifest list so the same tag serves local x86 and these nodes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bot-fleet-worker
+  namespace: benchmark
+spec:
+  template:
+    spec:
+      nodeSelector:
+        pool: botworker
+        kubernetes.io/arch: arm64
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: bot-fleet-worker
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: bot-fleet-worker
+          resources:
+            requests:
+              cpu: "3"
+              memory: 6Gi
+            limits:
+              cpu: "4"
+              memory: 7Gi

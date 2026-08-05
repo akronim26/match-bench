@@ -57,7 +57,43 @@ func (m *SessionManager) Add(sess *Session) (*Session, bool) {
 	}
 	m.sessions[sess.SessionID] = sess
 	metrics.Gauge("controller_active_sessions", "Active sessions tracked by the controller.", nil, float64(len(m.sessions)))
+	m.reportDemandLocked()
 	return sess, false
+}
+
+// DemandedWorkers sums WorkerCount across in-flight sessions: how many bot-fleet
+// shards must be servable right now.
+//
+// This is the autoscaling signal, and it is a DECLARATION rather than a symptom. The
+// controller computes each session's worker_count at admission, before publishing any
+// workload spec, and awaitReady already treats that number as authoritative. Kafka
+// consumer lag — the current KEDA trigger — only rises AFTER specs are published to
+// partitions nobody is consuming, which is too late to prevent the under-provisioned
+// publish that causes a partial ready fan-in.
+func (m *SessionManager) DemandedWorkers() uint32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.demandLocked()
+}
+
+// demandLocked sums WorkerCount over tracked sessions. Callers must hold mu.
+func (m *SessionManager) demandLocked() uint32 {
+	var total uint32
+	for _, s := range m.sessions {
+		total += s.WorkerCount
+	}
+	return total
+}
+
+// reportDemandLocked publishes the demand gauge. Callers must hold mu (write side),
+// mirroring how controller_active_sessions is published from Add/Drop.
+func (m *SessionManager) reportDemandLocked() {
+	metrics.Gauge(
+		"controller_demanded_workers",
+		"Bot-fleet workers demanded by in-flight sessions (sum of worker_count).",
+		nil,
+		float64(m.demandLocked()),
+	)
 }
 
 // Get applies behavior for its receiver performs the package-specific operation described by its name.
@@ -76,6 +112,7 @@ func (m *SessionManager) Drop(sessionID string) {
 	defer m.mu.Unlock()
 	delete(m.sessions, sessionID)
 	metrics.Gauge("controller_active_sessions", "Active sessions tracked by the controller.", nil, float64(len(m.sessions)))
+	m.reportDemandLocked()
 }
 
 // Snapshot applies behavior for its receiver performs the package-specific operation described by its name.

@@ -17,6 +17,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 )
 
 const namespace = "iicpc"
@@ -281,6 +282,19 @@ func projectMetricCatalog() []metricSpec {
 		counterSpec("controller_duplicate_benchmark_requested_total", "Duplicate benchmark.requested messages ignored by controller.", nil),
 		gaugeSpec("controller_active_sessions", "Active sessions tracked by the controller.", nil),
 		counterSpec("controller_unknown_ready_signal_total", "Ready signals for unknown sessions.", nil),
+		// The lease allocators' observability. This registry only exports names
+		// declared here — metric() returns nil and counts `unregistered_metric`
+		// for anything else — so without these three specs the Gauge/Counter calls
+		// in controller/lease.go and controller/consumer.go are silent no-ops and
+		// the leases are unobservable from outside the controller's logs.
+		// The autoscaling demand signal: sum of worker_count over in-flight
+		// sessions, i.e. how many bot-fleet shards must be servable right now.
+		// KEDA scales on this, so an unregistered name here means the fleet
+		// never scales.
+		gaugeSpec("controller_demanded_workers", "Bot-fleet workers demanded by in-flight sessions (sum of worker_count).", nil),
+		gaugeSpec("controller_leased_partitions", "Resources (partitions) currently leased by in-flight sessions.", nil),
+		gaugeSpec("controller_leased_order_bands", "Resources (order_bands) currently leased by in-flight sessions.", nil),
+		counterSpec("controller_admission_blocked_total", "Session admissions blocked by scarce capacity.", []string{"reason"}),
 		histogramSpec("db_query_duration_seconds", "PostgreSQL query duration in seconds.", []string{"operation", "service"}, defaultBuckets),
 		counterSpec("db_query_total", "PostgreSQL queries by operation and result.", []string{"operation", "result", "service"}),
 		counterSpec("harbor_promote_total", "Harbor image promotions by result.", []string{"result"}),
@@ -552,4 +566,26 @@ func (r *registry) recordError(reason string) {
 // It keeps validation, side effects, and returned values within this package's contract.
 func (r *registry) recordErrorLocked(reason string) {
 	r.errors.WithLabelValues(reason).Inc()
+}
+
+// RegistryErrorCount returns how many registry errors of `reason` have been
+// recorded. Exported so a service's own tests can assert that the metrics it emits
+// are actually exported.
+//
+// This registry deliberately exports only names present in its pre-declared catalog:
+// emitting an undeclared name is a silent no-op that increments
+// `unregistered_metric` and nothing else. That is easy to miss — three controller
+// lease metrics shipped in exactly that state — so a test asserting this counter
+// does not move is the cheapest guard against a metric that exists in code but never
+// reaches Prometheus.
+func RegistryErrorCount(reason string) uint64 {
+	var m dto.Metric
+	c, err := global.errors.GetMetricWithLabelValues(reason)
+	if err != nil {
+		return 0
+	}
+	if err := c.Write(&m); err != nil {
+		return 0
+	}
+	return uint64(m.GetCounter().GetValue())
 }

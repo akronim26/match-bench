@@ -1,0 +1,91 @@
+# overlays/eks-contest/results-export-job.yaml — the destroy gate's writer.
+#
+# Ephemeral cluster: Postgres, Timescale and the leaderboard die with
+# `terraform destroy`. This Job dumps them to the results S3 bucket
+# (infra/terraform-v2/export.tf) and writes a completion marker; the runbook
+# gates destroy on that marker. EKS-only by placement in this overlay.
+#
+# Run it (it is suspended so `apply -k` doesn't fire it on every sync):
+#   kubectl -n platform create job --from=cronjob/... — N/A; it is a plain Job:
+#   kubectl -n platform patch job results-export -p '{"spec":{"suspend":false}}'
+# or delete + re-apply this file with suspend: false.
+# Verify before destroy:
+#   aws s3 ls s3://<results-bucket>/<date>/ | grep EXPORT-COMPLETE
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: results-export
+  namespace: platform
+spec:
+  suspend: true
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: results-export
+    spec:
+      serviceAccountName: results-export
+      restartPolicy: Never
+      containers:
+        - name: export
+          # One image, two tools: postgres:16 provides pg_dump; the AWS CLI is
+          # installed at job start (~30s, once per export — acceptable for a
+          # run-once teardown job; the alternative is maintaining a custom
+          # pg_dump+awscli image for something that runs a handful of times).
+          image: postgres:16
+          command: ["/bin/bash", "-ec"]
+          args:
+            - |
+              apt-get update -qq && apt-get install -y -qq curl unzip >/dev/null
+              curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/aws.zip
+              unzip -q /tmp/aws.zip -d /tmp && /tmp/aws/install >/dev/null
+              STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+              DEST="s3://${RESULTS_BUCKET}/${STAMP}"
+              echo ">> exporting to ${DEST}"
+              pg_dump "$DATABASE_URL"  | gzip > /tmp/platform.sql.gz
+              pg_dump "$TIMESCALE_URL" | gzip > /tmp/metrics.sql.gz
+              aws s3 cp /tmp/platform.sql.gz "${DEST}/platform.sql.gz"
+              aws s3 cp /tmp/metrics.sql.gz  "${DEST}/metrics.sql.gz"
+              echo "exported ${STAMP}" | aws s3 cp - "${DEST}/EXPORT-COMPLETE"
+              echo ">> done: ${DEST}/EXPORT-COMPLETE"
+          env:
+            - name: RESULTS_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: results-export-config
+                  key: bucket
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: submission-api-secret
+                  key: database-url
+            - name: TIMESCALE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: telemetry-ingester-secrets
+                  key: TIMESCALE_URL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+# ServiceAccount carries the IRSA role (terraform output results_export_role_arn);
+# the annotation value is account-specific, stamped here for the known account.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: results-export
+  namespace: platform
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::885232248981:role/iicpc-contest-results-export
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: results-export-config
+  namespace: platform
+data:
+  bucket: iicpc-contest-results-885232248981

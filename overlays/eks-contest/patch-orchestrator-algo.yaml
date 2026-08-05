@@ -1,0 +1,19 @@
+# Contest sizing for contestant slots (docs/eks-contest-deployment.md §3):
+# ALGO 4 CPU / 8Gi Guaranteed on the 8-vCPU c6i.2xlarge sandbox node — one
+# slot per node; leaving RAM idle there is pointless, 8Gi lets the book grow
+# deep at 500k/s ramp. Base keeps the 2/1Gi laptop shape.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-orchestrator
+  namespace: sandbox
+spec:
+  template:
+    spec:
+      containers:
+        - name: sandbox-orchestrator
+          env:
+            - name: ALGO_CPU
+              value: "4"
+            - name: ALGO_MEMORY
+              value: 8Gi

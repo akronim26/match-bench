@@ -128,3 +128,48 @@ func TestIntegration_ListRunGroupsNilFilter(t *testing.T) {
 		})
 	}
 }
+
+// TestIntegration_ClaimNextRunInGroup pins sequential-within-group dispatch
+// (2026-08-02): claims hand out a group's `requested` runs one at a time in
+// session_id (= scenario) order, flip each to `queued`, and return nil once
+// exhausted. Concurrent/redelivered claims can never dispatch a run twice.
+func TestIntegration_ClaimNextRunInGroup(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	if dsn == "" {
+		t.Skip("set DATABASE_URL to run the claim integration test")
+	}
+	ctx := context.Background()
+	st, err := NewPostgresStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC()
+	sub := fmt.Sprintf("sub-claim-%d", now.UnixNano())
+	grp := fmt.Sprintf("rg-claim-%d", now.UnixNano())
+	// session_id order = dispatch order; first child enters as queued (it is
+	// dispatched directly by StartBenchmark).
+	children := []RunMeta{
+		{SessionID: grp + "-1", SubmissionID: sub, RunGroupID: grp, ScenarioID: "sc-correctness", Status: "queued", CreatedAt: now, UpdatedAt: now},
+		{SessionID: grp + "-2", SubmissionID: sub, RunGroupID: grp, ScenarioID: "sc-ramp", Status: "requested", CreatedAt: now, UpdatedAt: now},
+		{SessionID: grp + "-3", SubmissionID: sub, RunGroupID: grp, ScenarioID: "sc-spike", Status: "requested", CreatedAt: now, UpdatedAt: now},
+	}
+	g := RunGroupMeta{RunGroupID: grp, SubmissionID: sub, ContestantID: "c", Status: "requested", CreatedAt: now, UpdatedAt: now}
+	if err := st.InsertRunGroupWithChildren(ctx, g, children); err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	first, err := st.ClaimNextRunInGroup(ctx, grp)
+	if err != nil || first == nil || first.SessionID != grp+"-2" {
+		t.Fatalf("claim 1 = %+v, %v; want session %s-2 (the queued first child is never re-claimed)", first, err, grp)
+	}
+	second, err := st.ClaimNextRunInGroup(ctx, grp)
+	if err != nil || second == nil || second.SessionID != grp+"-3" {
+		t.Fatalf("claim 2 = %+v, %v; want session %s-3", second, err, grp)
+	}
+	third, err := st.ClaimNextRunInGroup(ctx, grp)
+	if err != nil || third != nil {
+		t.Fatalf("claim 3 = %+v, %v; want nil (exhausted)", third, err)
+	}
+}

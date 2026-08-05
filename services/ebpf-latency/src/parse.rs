@@ -9,7 +9,22 @@ use crate::capture::{Direction, Transport};
 const SOH: u8 = 0x01;
 const PRICE_SCALE: u64 = 1_000_000_000;
 const MAX_FIX_MESSAGE: usize = 64 * 1024;
+/// FIX_BEGIN is the real start-of-message marker: tag 8 (BeginString) always carries a
+/// value starting "FIX". Resync MUST search for this, not for a bare "8=".
+///
+/// "8=" is not a message boundary — it occurs inside almost every message, because tag 38
+/// (OrderQty) renders as "38=", as do 58, 108, 118. Searching for it made recovery
+/// pathological: after any desync the framer landed on a false start inside the NEXT
+/// message's 38=, passed the two-byte check, failed the "9=" check one field later,
+/// resynced again, and walked forward in small steps — burning a whole message or more per
+/// desync instead of jumping to the next real boundary. Measured at ~284 bytes skipped per
+/// lost request on a pass-1 run.
+const FIX_BEGIN: &[u8] = b"8=FIX";
 const MAX_HTTP_MESSAGE: usize = 64 * 1024;
+/// Upper bound on a WebSocket frame the capture will wait for. Matches the reassembler's
+/// MAX_BUFFERED: a frame larger than the buffer can never be completed, so waiting for one
+/// would stall the flow permanently.
+const MAX_WS_MESSAGE: usize = 1 << 20;
 
 #[derive(Debug, PartialEq, Eq)]
 /// Frame enumerates the states or variants handled by this module.
@@ -72,19 +87,36 @@ pub fn parse(transport: Transport, direction: Direction, msg: &[u8]) -> ParsedMe
 /// frame_fix performs the module-specific operation described by its name.
 /// It keeps validation, side effects, and returned values within this module's contract.
 fn frame_fix(buf: &[u8]) -> Frame {
-    if buf.len() < 2 {
+    if buf.len() < FIX_BEGIN.len() {
+        // Too short to tell a real BeginString from a prefix of one. Waiting is correct:
+        // skipping here would discard the head of a message that is merely incomplete.
         return Frame::Incomplete;
     }
-    if &buf[0..2] != b"8=" {
-        return match find(buf, b"8=") {
+    if !buf.starts_with(FIX_BEGIN) {
+        return match find(buf, FIX_BEGIN) {
             Some(i) => Frame::Resync(i),
-            None => Frame::Resync(buf.len().saturating_sub(1)),
+            // No boundary anywhere in the buffer. Retain the last FIX_BEGIN.len()-1 bytes:
+            // a genuine "8=FIX" may straddle the end of what has been reassembled so far,
+            // and skipping it would turn one desync into a second.
+            None => Frame::Resync(buf.len().saturating_sub(FIX_BEGIN.len() - 1)),
         };
     }
     let Some(soh1) = find_byte(buf, SOH, 0) else {
         return Frame::Incomplete;
     };
-    if buf.len() < soh1 + 3 || &buf[soh1 + 1..soh1 + 3] != b"9=" {
+    // "Not enough bytes yet" is NOT "malformed", and conflating them was a data-loss
+    // bug: a buffer holding exactly "8=FIX.4.2\x01" plus a byte or two is the head of a
+    // perfectly good message that has not finished arriving, and resyncing here discarded
+    // it. The remainder then began mid-message, so the next call skipped forward to the
+    // following BeginString and the whole order was lost — no packet loss required.
+    //
+    // It fires whenever a TCP segment boundary lands within a couple of bytes of a
+    // message's BeginString: about one boundary per segment over ~7 messages, which
+    // matches the ~0.2% of requests that went missing per pass-1 run.
+    if buf.len() < soh1 + 3 {
+        return Frame::Incomplete;
+    }
+    if &buf[soh1 + 1..soh1 + 3] != b"9=" {
         return Frame::Resync(soh1 + 1);
     }
     let Some(soh2) = find_byte(buf, SOH, soh1 + 3) else {
@@ -166,17 +198,39 @@ fn frame_http_ws(direction: Direction, buf: &[u8]) -> Frame {
         return Frame::Incomplete;
     }
     if looks_like_http(buf) {
-        frame_http(buf)
-    } else {
-        frame_ws(direction, buf)
+        return frame_http(buf);
     }
+    // "Not enough bytes yet" is NOT "malformed" — the same conflation that cost FIX ~0.2% of
+    // its requests (see frame_fix). looks_like_http needs four bytes to recognise a method,
+    // so a buffer holding "P", "PO" or "POS" is the head of a good request that has not
+    // finished arriving. Falling through to frame_ws here reads byte 1 as a WebSocket length
+    // header, finds the mask bit inconsistent with the direction, and resyncs into the middle
+    // of the request.
+    //
+    // Only STRICT prefixes of a method token wait. A two-byte WebSocket frame is not a prefix
+    // of any of them, so genuine short frames are unaffected.
+    if is_http_method_prefix(buf) {
+        return Frame::Incomplete;
+    }
+    frame_ws(direction, buf)
+}
+
+/// The tokens that open an HTTP message. Shared by looks_like_http and
+/// is_http_method_prefix so the two can never disagree about what counts as HTTP.
+const HTTP_PREFIXES: [&[u8]; 5] = [b"POST", b"GET ", b"PUT ", b"DELE", b"HTTP"];
+
+/// True when `buf` is a strict prefix of an HTTP method token — too short to classify, but
+/// consistent with a request that is still arriving.
+fn is_http_method_prefix(buf: &[u8]) -> bool {
+    HTTP_PREFIXES
+        .iter()
+        .any(|p| buf.len() < p.len() && p.starts_with(buf))
 }
 
 /// looks_like_http performs the module-specific operation described by its name.
 /// It keeps validation, side effects, and returned values within this module's contract.
 fn looks_like_http(buf: &[u8]) -> bool {
-    const PREFIXES: [&[u8]; 5] = [b"POST", b"GET ", b"PUT ", b"DELE", b"HTTP"];
-    PREFIXES.iter().any(|p| buf.starts_with(p))
+    HTTP_PREFIXES.iter().any(|p| buf.starts_with(p))
 }
 
 /// frame_http performs the module-specific operation described by its name.
@@ -234,6 +288,17 @@ fn frame_ws(direction: Direction, buf: &[u8]) -> Frame {
     if buf.len() < 2 {
         return Frame::Incomplete;
     }
+    // Byte 0 is FIN | RSV1 | RSV2 | RSV3 | opcode(4). Validating it is the only structure a
+    // WebSocket stream offers for re-synchronisation: unlike FIX ("8=FIX.4.2") and HTTP
+    // ("POST"), a binary frame header has no reserved marker, so after a gap the framer was
+    // reading JSON payload bytes as headers and wandering through the stream — a hole cost
+    // far more than its own bytes.
+    //
+    // Only 12 of 256 byte values are legal here, and every printable ASCII byte (0x20-0x7E)
+    // sets a bit in the RSV mask, so a JSON payload cannot masquerade as a header.
+    if !is_ws_frame_header(buf[0]) {
+        return Frame::Resync(1);
+    }
     let masked = buf[1] & 0x80 != 0;
     let len7 = (buf[1] & 0x7f) as usize;
     let (mut header, payload_len) = if len7 < 126 {
@@ -244,7 +309,22 @@ fn frame_ws(direction: Direction, buf: &[u8]) -> Frame {
         }
         (4usize, ((buf[2] as usize) << 8) | buf[3] as usize)
     } else {
-        return Frame::Resync(1);
+        // len7 == 127: the 64-bit extended length, which RFC 6455 requires for any payload
+        // past 65535 bytes — reachable by an engine that batches execution reports. Treating
+        // it as malformed desynchronised the stream one byte at a time, losing the frame and
+        // walking into the next.
+        if buf.len() < 10 {
+            return Frame::Incomplete;
+        }
+        let len = u64::from_be_bytes([
+            buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+        ]);
+        // A frame larger than the reassembler can ever hold would stall this flow forever
+        // waiting for bytes that cannot be buffered, so treat it as a desync instead.
+        if len > MAX_WS_MESSAGE as u64 {
+            return Frame::Resync(1);
+        }
+        (10usize, len as usize)
     };
     if masked {
         header += 4;
@@ -258,6 +338,58 @@ fn frame_ws(direction: Direction, buf: &[u8]) -> Frame {
         return Frame::Incomplete;
     }
     Frame::Message(total)
+}
+
+/// True when `b` can legally open a WebSocket frame: reserved bits clear and a defined
+/// opcode (continuation, text, binary, close, ping, pong).
+///
+/// RSV1 is treated as illegal rather than tolerated. It signals `permessage-deflate`, and a
+/// compressed payload carries no readable `cl_ord_id` no matter how it is framed — so the
+/// submission is unscoreable either way. Tolerating RSV1 would double the accepted byte
+/// space and, worse, admit 0x40-0x4F ("@" through "O"), which appear throughout ordinary
+/// JSON — measurably weakening the very marker this function exists to provide.
+fn is_ws_frame_header(b: u8) -> bool {
+    b & 0x70 == 0 && matches!(b & 0x0f, 0x0 | 0x1 | 0x2 | 0x8 | 0x9 | 0xA)
+}
+
+/// True when `buf` opens what would be a legal WebSocket frame except that RSV1 is set —
+/// i.e. a `permessage-deflate` compressed frame.
+///
+/// Compression is not supported: the pipeline reads `cl_ord_id` out of the payload as plain
+/// JSON. Without this, such a submission desynchronises and goes silent, which is
+/// indistinguishable from an engine that answered nothing. Counting it turns that into a
+/// named signal instead of a mystery zero.
+///
+/// Checking byte 0 ALONE is not enough, and shipping that was a mistake: roughly 9% of
+/// arbitrary bytes satisfy it, so a REST session that had been holed by ring-buffer drops
+/// reported 925 "compressed frames" on a stream carrying no WebSocket at all. Port 8080
+/// serves REST and WS both, so the transport cannot disambiguate it either. The frame must
+/// therefore be plausible as a WHOLE — correct mask direction and a length that actually
+/// fits — before this claims anything.
+pub fn ws_looks_compressed(direction: Direction, buf: &[u8]) -> bool {
+    if buf.len() < 2 {
+        return false;
+    }
+    // RSV1 set, RSV2/RSV3 clear, defined opcode.
+    if buf[0] & 0x40 == 0 || buf[0] & 0x30 != 0 {
+        return false;
+    }
+    if !matches!(buf[0] & 0x0f, 0x0 | 0x1 | 0x2 | 0x8 | 0x9 | 0xA) {
+        return false;
+    }
+    // Masking is mandatory client-to-server and forbidden server-to-client; a mismatch
+    // means these bytes are not a frame header at all.
+    let masked = buf[1] & 0x80 != 0;
+    if masked != (direction == Direction::Request) {
+        return false;
+    }
+    // And the frame must actually fit what has been reassembled.
+    let len7 = (buf[1] & 0x7f) as usize;
+    if len7 >= 126 {
+        return false;
+    }
+    let header = 2 + if masked { 4 } else { 0 };
+    header + len7 <= buf.len()
 }
 
 /// parse_http_ws performs the module-specific operation described by its name.
@@ -286,6 +418,13 @@ fn ws_unmasked_payload(direction: Direction, frame: &[u8]) -> Vec<u8> {
         (2usize, len7)
     } else if len7 == 126 && frame.len() >= 4 {
         (4usize, ((frame[2] as usize) << 8) | frame[3] as usize)
+    } else if len7 == 127 && frame.len() >= 10 {
+        // Must mirror frame_ws: framing a 64-bit-length frame correctly but then reading an
+        // empty body here would move the loss downstream rather than fix it.
+        let len = u64::from_be_bytes([
+            frame[2], frame[3], frame[4], frame[5], frame[6], frame[7], frame[8], frame[9],
+        ]);
+        (10usize, len as usize)
     } else {
         return Vec::new();
     };
@@ -340,10 +479,13 @@ fn parse_json(direction: Direction, body: &[u8]) -> ParsedMessage {
 /// find performs the module-specific operation described by its name.
 /// It keeps validation, side effects, and returned values within this module's contract.
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() {
+    // memmem, not a positional scan: the naive version compiled to a memcmp
+    // call per byte offset and was 63% of the HTTP pipeline profile
+    // (docs/http-pipeline-flamegraph.svg, 2026-08-01).
+    if needle.is_empty() {
         return None;
     }
-    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+    memchr::memmem::find(hay, needle)
 }
 
 /// find_byte performs the module-specific operation described by its name.
@@ -422,11 +564,27 @@ fn header_content_length(headers: &[u8]) -> Option<usize> {
     parse_uint(&val).map(|v| v as usize)
 }
 
+/// Longest JSON key the extractors look up; patterns are built on the stack
+/// (`format!` here allocated per field per message — ~15% of the HTTP
+/// pipeline profile between malloc/free/format_inner).
+const MAX_JSON_KEY: usize = 30;
+
+/// key_pattern writes `"key"` into `buf` and returns the filled slice.
+fn key_pattern<'a>(buf: &'a mut [u8; MAX_JSON_KEY + 2], key: &str) -> &'a [u8] {
+    let k = key.as_bytes();
+    debug_assert!(k.len() <= MAX_JSON_KEY, "raise MAX_JSON_KEY for {key}");
+    buf[0] = b'"';
+    buf[1..1 + k.len()].copy_from_slice(k);
+    buf[1 + k.len()] = b'"';
+    &buf[..k.len() + 2]
+}
+
 /// json_string performs the module-specific operation described by its name.
 /// It keeps validation, side effects, and returned values within this module's contract.
 fn json_string(body: &[u8], key: &str) -> Option<String> {
-    let pat = format!("\"{key}\"");
-    let i = find(body, pat.as_bytes())?;
+    let mut pbuf = [0u8; MAX_JSON_KEY + 2];
+    let pat = key_pattern(&mut pbuf, key);
+    let i = find(body, pat)?;
     let rest = &body[i + pat.len()..];
     let colon = rest.iter().position(|&b| b == b':')?;
     let after = &rest[colon + 1..];
@@ -439,8 +597,9 @@ fn json_string(body: &[u8], key: &str) -> Option<String> {
 /// json_value_slice performs the module-specific operation described by its name.
 /// It keeps validation, side effects, and returned values within this module's contract.
 fn json_value_slice<'a>(body: &'a [u8], key: &str) -> Option<&'a [u8]> {
-    let pat = format!("\"{key}\"");
-    let i = find(body, pat.as_bytes())?;
+    let mut pbuf = [0u8; MAX_JSON_KEY + 2];
+    let pat = key_pattern(&mut pbuf, key);
+    let i = find(body, pat)?;
     let rest = &body[i + pat.len()..];
     let colon = rest.iter().position(|&b| b == b':')?;
     let after = &rest[colon + 1..];
@@ -467,6 +626,106 @@ fn json_decimal_scaled(body: &[u8], key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A valid message head that has not finished arriving must WAIT, never resync.
+    ///
+    /// This is the bug that produced the entire capture-gap population. Sampled live:
+    /// buffered=11, sample="8=FIX.4.2|9" — a good message whose head was discarded because
+    /// the length check shared a branch with the malformed check. The remainder then
+    /// started mid-message and the next resync skipped 229 bytes to the next BeginString,
+    /// taking the order with it.
+    #[test]
+    fn fix_frame_waits_when_begin_string_arrives_without_the_length_field() {
+        for partial in [
+            &b"8=FIX.4.2\x01"[..],
+            &b"8=FIX.4.2\x019"[..],
+            &b"8=FIX.4.4\x01"[..],
+        ] {
+            assert!(
+                matches!(frame_fix(partial), Frame::Incomplete),
+                "a message head must be awaited, not discarded: {:?}",
+                String::from_utf8_lossy(partial)
+            );
+        }
+    }
+
+    /// Once enough bytes exist, a genuinely wrong second tag still resyncs.
+    #[test]
+    fn fix_frame_resyncs_when_the_second_tag_is_not_body_length() {
+        let buf = b"8=FIX.4.2\x0134=1\x0110=000\x01";
+        assert!(
+            matches!(frame_fix(buf), Frame::Resync(_)),
+            "a real malformed frame must still resync"
+        );
+    }
+
+    /// A desync must land on the NEXT REAL message, not on "8=" inside tag 38.
+    ///
+    /// This is the bug that made a 0.2% request loss self-amplifying: mid-message bytes
+    /// followed by a complete order. Searching for a bare "8=" matched the "8=" inside
+    /// "38=100", so the framer resynced into the middle of the very message it was trying
+    /// to recover, then walked forward field by field and consumed it entirely.
+    #[test]
+    fn fix_resync_skips_to_begin_string_not_to_tag_38() {
+        let garbage = b"45=x\x0138=100\x01";
+        let msg = b"8=FIX.4.4\x019=5\x0135=D\x0110=000\x01";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(garbage);
+        buf.extend_from_slice(msg);
+
+        match frame_fix(&buf) {
+            Frame::Resync(skip) => {
+                assert_eq!(
+                    skip,
+                    garbage.len(),
+                    "resync must skip exactly the garbage and land on 8=FIX, not inside 38="
+                );
+                assert!(
+                    buf[skip..].starts_with(FIX_BEGIN),
+                    "post-resync buffer must start at a real message boundary"
+                );
+            }
+            other => panic!("expected Resync, got {other:?}"),
+        }
+    }
+
+    /// A buffer holding only mid-message bytes keeps the last few, so a BeginString
+    /// straddling the reassembly boundary is not chopped in half.
+    #[test]
+    fn fix_resync_without_a_boundary_retains_a_partial_begin_string() {
+        let buf = b"38=100\x0144=9\x018=FI";
+        match frame_fix(buf) {
+            Frame::Resync(skip) => {
+                assert_eq!(skip, buf.len() - (FIX_BEGIN.len() - 1));
+                assert_eq!(
+                    &buf[skip..],
+                    b"8=FI",
+                    "the partial BeginString must survive"
+                );
+            }
+            other => panic!("expected Resync, got {other:?}"),
+        }
+    }
+
+    /// "8=" appearing inside a field must never be treated as a message start.
+    #[test]
+    fn fix_frame_does_not_start_on_tag_38() {
+        let buf = b"38=100\x0110=000\x01";
+        match frame_fix(buf) {
+            Frame::Resync(_) => {}
+            other => panic!("tag 38 must not frame as a message, got {other:?}"),
+        }
+    }
+
+    /// Fewer bytes than "8=FIX" is incomplete, not a desync: discarding here would eat
+    /// the head of a message that has merely not fully arrived.
+    #[test]
+    fn fix_frame_waits_for_enough_bytes_to_identify_a_boundary() {
+        assert!(matches!(frame_fix(b"8=F"), Frame::Incomplete));
+        assert!(matches!(frame_fix(b""), Frame::Incomplete));
+    }
+
     use super::*;
 
     #[test]

@@ -16,7 +16,9 @@ name = "fix_echo"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+# "time" is required by the EMFILE/ENFILE backoff in the accept loop (main.rs);
+# without it `tokio::time` is compiled out and the crate fails to build.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 
 [profile.release]
 opt-level = 3

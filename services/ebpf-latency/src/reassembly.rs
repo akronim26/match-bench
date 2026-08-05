@@ -8,6 +8,11 @@ use std::collections::BTreeMap;
 
 const MAX_BUFFERED: usize = 1 << 20; // 1 MiB
 const MAX_HOLD_SEGMENTS: usize = 64;
+/// Pushes with data held but no forward progress before the hole ahead of `next_seq` is
+/// declared lost. Small enough that a stall costs a handful of segments, large enough that
+/// ordinary reordering (which resolves within a segment or two) is never mistaken for a
+/// hole.
+const GAP_SKIP_AFTER_STALLED_PUSHES: u32 = 4;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 /// PushStats stores the state passed across this module boundary.
@@ -16,6 +21,17 @@ pub struct PushStats {
     pub reordered: bool,
     pub retransmitted_bytes: usize,
     pub reset: bool,
+    /// hold_overflow: more than MAX_HOLD_SEGMENTS out-of-order segments were waiting on a
+    /// predecessor that never arrived, so the whole hold set was discarded. Every FIX
+    /// message in those bytes is lost — a request lost this way leaves its responses
+    /// unmatchable, and an order that loses all of its records becomes a capture gap.
+    pub hold_overflow: bool,
+    /// gap_skipped_bytes: a hole was declared permanently lost and `next_seq` jumped over
+    /// it. Only these bytes are gone; everything after them is recovered.
+    pub gap_skipped_bytes: usize,
+    /// buffer_overflow: the contiguous stream buffer passed MAX_BUFFERED and was reset.
+    /// Same consequence as hold_overflow, different trigger.
+    pub buffer_overflow: bool,
 }
 
 #[derive(Debug)]
@@ -29,6 +45,12 @@ pub struct Reassembler {
     marks: Vec<(u64, u64, u32)>,
     hold: BTreeMap<u32, (u64, Vec<u8>)>,
     last_activity_ns: u64,
+    /// Consecutive pushes that produced no forward progress while data sat in `hold`.
+    /// The capture never sees a retransmission for a segment the kernel already delivered
+    /// to the application, so a hole here can be permanent — and `next_seq` advances only
+    /// through contiguous data. Without this, one missing segment stalls the flow for the
+    /// rest of the session: measured live as a 0.2% loss becoming 93.8%.
+    stalled_pushes: u32,
 }
 
 impl Default for Reassembler {
@@ -51,6 +73,7 @@ impl Reassembler {
             marks: Vec::new(),
             hold: BTreeMap::new(),
             last_activity_ns: 0,
+            stalled_pushes: 0,
         }
     }
 
@@ -116,6 +139,7 @@ impl Reassembler {
         }
 
         let had_hold = !self.hold.is_empty();
+        let seq_before = self.next_seq;
         let gap = seq.wrapping_sub(self.next_seq) as i32;
         if gap == 0 {
             self.append_contiguous(ts, data);
@@ -139,16 +163,49 @@ impl Reassembler {
             stats.reordered = true;
             self.hold.insert(seq, (ts, data.to_vec()));
             if self.hold.len() > MAX_HOLD_SEGMENTS {
-                self.hold.clear();
-                stats.reset = true;
+                // Previously this cleared the hold outright, discarding every segment
+                // waiting behind the hole AND leaving next_seq pinned to it, so the flow
+                // stalled and the same overflow repeated forever. Skipping the hole keeps
+                // the held data and costs only the missing bytes.
+                stats.hold_overflow = true;
+                stats.gap_skipped_bytes += self.skip_gap();
             }
+        }
+
+        // Forward progress check. `next_seq` only moves through contiguous data, so if it
+        // has not moved while segments are queued, the bytes in between are not coming.
+        if self.next_seq == seq_before && !self.hold.is_empty() {
+            self.stalled_pushes += 1;
+            if self.stalled_pushes >= GAP_SKIP_AFTER_STALLED_PUSHES {
+                stats.gap_skipped_bytes += self.skip_gap();
+            }
+        } else {
+            self.stalled_pushes = 0;
         }
 
         if self.buf.len() > MAX_BUFFERED {
             self.reset_buffer();
             stats.reset = true;
+            stats.buffer_overflow = true;
         }
         stats
+    }
+
+    /// skip_gap declares the hole ahead of `next_seq` permanently lost and jumps to the
+    /// earliest held segment, returning the bytes written off.
+    ///
+    /// This is what bounds the cost of a missing segment to the missing segment. The
+    /// framer then resyncs from a real message boundary and the stream continues; without
+    /// it the flow is dead from the first hole onward.
+    fn skip_gap(&mut self) -> usize {
+        let Some(&target) = self.hold.keys().next() else {
+            return 0;
+        };
+        let lost = target.wrapping_sub(self.next_seq) as usize;
+        self.next_seq = target;
+        self.stalled_pushes = 0;
+        self.drain_hold();
+        lost
     }
 
     /// reset_buffer performs the module-specific operation described by its name.

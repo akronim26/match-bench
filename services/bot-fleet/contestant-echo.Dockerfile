@@ -2,8 +2,10 @@
 # ACKs every NewOrderSingle (35=8, OrdStatus=New). Built from repo root:
 #   docker build -f services/bot-fleet/contestant-echo.Dockerfile -t <ref> .
 FROM rust:1.96-bookworm AS builder
+# clang + libclang-dev: this compiles iicpc-bot-fleet, whose rdkafka carries the
+# `zstd` feature (zstd-1 on orders.*) -> zstd-sys -> bindgen -> dlopen(libclang).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends cmake build-essential librdkafka-dev pkg-config \
+    && apt-get install -y --no-install-recommends cmake build-essential librdkafka-dev pkg-config clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./

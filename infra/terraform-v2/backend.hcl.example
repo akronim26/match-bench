@@ -1,0 +1,7 @@
+# Copy to backend.hcl (gitignored) and fill in. Used via:
+#   terraform init -backend-config=backend.hcl
+bucket         = "CHANGE-ME-iicpc-tf-state"
+key            = "contest/terraform.tfstate"
+region         = "us-east-1"
+dynamodb_table = "iicpc-tf-lock"
+encrypt        = true

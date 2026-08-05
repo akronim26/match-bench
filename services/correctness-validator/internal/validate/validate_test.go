@@ -1,4 +1,8 @@
-// Package validate defines tests for validate test.
+// Package validate defines the shared fixture helpers for this package's tests.
+//
+// The scoring tests that used to live here drove the batch validate.Run; they now drive
+// StreamValidator and live in stream_test.go (per-class scenarios), stream_smp_test.go
+// (self-match, missed fills, determinism) and v2_test.go (ordering/priority).
 //
 // This file is part of the IICPC benchmarking platform and keeps its
 // responsibilities local to the surrounding package. It should be read with
@@ -6,137 +10,36 @@
 package validate
 
 import (
-	"reflect"
-	"testing"
-
 	"github.com/iicpc/correctness-validator/internal/model"
 )
 
-// fill performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
+// fill is an execution report claiming `qty` filled at `price`.
 func fill(qty, price uint64) model.Response {
 	return model.Response{ExecType: "2", FillQty: qty, FillPrice: price}
 }
 
-// order performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
+// order builds an id-less (unconstrained) order: HasSMPID stays false, so it matches
+// anything. Use orderSMP when the test needs self-match-prevention identity.
 func order(id string, kind model.Kind, side model.Side, price int64, qty uint64, resp ...model.Response) *model.Order {
 	return &model.Order{OrderID: id, Kind: kind, Side: side, Price: price, Qty: qty, Responses: resp}
 }
 
-// TestCleanCrossIsAllValid performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func TestCleanCrossIsAllValid(t *testing.T) {
-	ordered := []*model.Order{
-		order("S1", model.NewLimit, model.Sell, 100, 10, fill(10, 100)),
-		order("B1", model.NewLimit, model.Buy, 100, 10, fill(10, 100)),
-	}
-	r := Run(ordered, nil)
-	if r.TotalFills != 2 || r.ValidFills != 2 {
-		t.Fatalf("expected 2/2 valid, got %+v", r)
-	}
-	if r.CorrectnessScore() != 1.0 || len(r.Violations) != 0 {
-		t.Fatalf("expected score 1.0 no violations, got %+v", r)
-	}
+// orderSMP is `order` with a self-match-prevention id attached. Self-trade is keyed on
+// this, not on the task id embedded in the order id, so a test that wants a self-trade
+// must give both sides the same SMP id.
+func orderSMP(id string, kind model.Kind, side model.Side, price int64, qty uint64, smp uint32, resp ...model.Response) *model.Order {
+	o := order(id, kind, side, price, qty, resp...)
+	o.SMPID, o.HasSMPID = smp, true
+	return o
 }
 
-// TestOverfillFlagged performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func TestOverfillFlagged(t *testing.T) {
-	ordered := []*model.Order{
-		order("S1", model.NewLimit, model.Sell, 100, 20),
-		order("B1", model.NewLimit, model.Buy, 100, 10, fill(6, 100), fill(6, 100)),
-	}
-	r := Run(ordered, nil)
-	if r.Overfills != 1 {
-		t.Fatalf("expected 1 overfill, got %+v", r)
-	}
-	if r.TotalFills != 2 || r.ValidFills != 1 {
-		t.Fatalf("expected 2 total / 1 valid, got %+v", r)
-	}
-}
-
-// TestPhantomFlagged performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func TestPhantomFlagged(t *testing.T) {
-	r := Run(nil, []ReportedFill{{OrderID: "ghost", Qty: 5, Price: 100}})
-	if r.PhantomFills != 1 || r.TotalFills != 1 || r.ValidFills != 0 {
-		t.Fatalf("expected 1 phantom / 0 valid, got %+v", r)
-	}
-	if r.Violations[0].Type != Phantom {
-		t.Fatalf("expected phantom violation, got %v", r.Violations[0].Type)
-	}
-}
-
-// TestWrongPriceFlagged performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func TestWrongPriceFlagged(t *testing.T) {
-	ordered := []*model.Order{
-		order("S1", model.NewLimit, model.Sell, 100, 10),
-		order("B1", model.NewLimit, model.Buy, 100, 10, fill(10, 101)),
-	}
-	r := Run(ordered, nil)
-	if r.PriceViolations != 1 || r.ValidFills != 0 {
-		t.Fatalf("expected 1 price violation / 0 valid, got %+v", r)
-	}
-}
-
-// TestFillBeyondReferenceQtyFlagged performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func TestFillBeyondReferenceQtyFlagged(t *testing.T) {
-	ordered := []*model.Order{
-		order("S1", model.NewLimit, model.Sell, 100, 10),
-		order("B1", model.NewLimit, model.Buy, 100, 20, fill(15, 100)),
-	}
-	r := Run(ordered, nil)
-	if r.PriceViolations != 1 || r.ValidFills != 0 {
-		t.Fatalf("expected reported-beyond-reference flagged, got %+v", r)
-	}
-}
-
-// TestUnderReportIsValid performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func TestUnderReportIsValid(t *testing.T) {
-	ordered := []*model.Order{
-		order("S1", model.NewLimit, model.Sell, 100, 10),
-		order("B1", model.NewLimit, model.Buy, 100, 10, fill(5, 100)),
-	}
-	r := Run(ordered, nil)
-	if r.ValidFills != 1 || len(r.Violations) != 0 {
-		t.Fatalf("under-report should be valid, got %+v", r)
-	}
-}
-
-// TestDeterministic performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func TestDeterministic(t *testing.T) {
-	build := func() []*model.Order {
-		return []*model.Order{
-			order("S1", model.NewLimit, model.Sell, 100, 20),
-			order("B1", model.NewLimit, model.Buy, 100, 10, fill(6, 100), fill(6, 100)),
-			order("B2", model.NewLimit, model.Buy, 100, 10, fill(10, 100)),
+// violationsOfType counts retained violation examples of one class.
+func violationsOfType(r Report, vt ViolationType) int {
+	n := 0
+	for _, v := range r.Violations {
+		if v.Type == vt {
+			n++
 		}
 	}
-	r1 := Run(build(), []ReportedFill{{OrderID: "ghost", Qty: 1, Price: 50}})
-	r2 := Run(build(), []ReportedFill{{OrderID: "ghost", Qty: 1, Price: 50}})
-	if !reflect.DeepEqual(r1, r2) {
-		t.Fatalf("validation not deterministic:\n r1=%+v\n r2=%+v", r1, r2)
-	}
-}
-
-// TestWindowsOverlap performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func TestWindowsOverlap(t *testing.T) {
-	if !windowsOverlap(1000, 1500, 1600, 200) {
-		t.Fatal("should overlap: avail exit 1500 within [1400,1800]")
-	}
-	if windowsOverlap(1000, 1300, 1600, 200) {
-		t.Fatal("should NOT overlap: avail exit 1300 before window 1400")
-	}
-	if !windowsOverlap(0, ^uint64(0), 5, 1) {
-		t.Fatal("still-resting liquidity should overlap any window")
-	}
-	if windowsOverlap(5000, ^uint64(0), 100, 50) {
-		t.Fatal("should NOT overlap: avail enter 5000 after window hi 150")
-	}
+	return n
 }

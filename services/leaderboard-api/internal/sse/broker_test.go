@@ -76,9 +76,9 @@ func TestHeartbeatKeepalive(t *testing.T) {
 // It keeps validation, side effects, and returned values within this package's contract.
 func TestSlowClientDrop(t *testing.T) {
 	b := New(nil)
-	ch := make(chan []byte, 1)
+	ch := make(chan sseMessage, 1)
 	b.clients[ch] = struct{}{}
-	ch <- []byte("full")
+	ch <- sseMessage{event: "update", data: []byte("full")}
 	b.Broadcast(topics.LeaderboardUpdateEvent{RunGroupID: "rg"})
 	if b.ClientCount() != 0 {
 		t.Fatalf("slow client was not dropped")

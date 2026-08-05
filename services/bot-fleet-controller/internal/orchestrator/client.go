@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -50,12 +51,30 @@ type Client struct {
 	http    *http.Client
 }
 
+// defaultSlotHTTPTimeout bounds a single orchestrator call. 180s, not the
+// original 15s (raised 2026-08-03 after the first EKS run): slot creation
+// blocks until the contestant pod is observable, and on a real registry that
+// includes the FIRST PULL of that submission's image. Locally every image was
+// pre-imported into containerd, so 15s always sufficed and the limit was
+// invisible; in a contest EVERY new submission is a cold pull, and a timeout
+// here fails the session with "context deadline exceeded" while the
+// orchestrator is still healthily waiting (its own request context is
+// canceled mid-flight, which is what the confusing "context canceled" pod-get
+// error was). Override with ORCHESTRATOR_HTTP_TIMEOUT (Go duration).
+const defaultSlotHTTPTimeout = 180 * time.Second
+
 // NewClient performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
 func NewClient(baseURL string) *Client {
+	timeout := defaultSlotHTTPTimeout
+	if v := os.Getenv("ORCHESTRATOR_HTTP_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			timeout = d
+		}
+	}
 	return &Client{
 		baseURL: baseURL,
-		http:    &http.Client{Timeout: 15 * time.Second},
+		http:    &http.Client{Timeout: timeout},
 	}
 }
 
@@ -65,13 +84,25 @@ type createSlotRequest struct {
 	SlotID       string `json:"slot_id"`
 	ContestantID string `json:"contestant_id"`
 	Image        string `json:"image"`
-	Port         int    `json:"port"`
+	// Ports, not a single Port. A ProtocolAll submission serves FIX on 9898 and
+	// REST+WS on 8080, and sandbox-orchestrator has always accepted a `ports` array
+	// (createSlotRequest.resolvePorts) — this side simply never sent one. The pod
+	// therefore exposed only the submission's primary port, so every REST and WS task
+	// connected to a port the pod did not have and timed out. It reproduced with a
+	// single task per protocol, which is what ruled out load and concurrency.
+	Ports []int `json:"ports"`
+	// OrderBand is the session's leased exclusive orders.sent/orders.acked
+	// partition band (see bot-fleet-controller's band lease allocator).
+	// sandbox-orchestrator forwards it as the ORDER_BAND env var on the
+	// capture container so ebpf-latency can partition orders.acked without
+	// re-deriving the band by hash.
+	OrderBand uint32 `json:"order_band"`
 }
 
 // CreateSlot applies behavior for its receiver performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func (c *Client) CreateSlot(ctx context.Context, slotID, contestantID, image string, port int) (*Slot, error) {
-	body, err := json.Marshal(createSlotRequest{SlotID: slotID, ContestantID: contestantID, Image: image, Port: port})
+func (c *Client) CreateSlot(ctx context.Context, slotID, contestantID, image string, ports []int, orderBand uint32) (*Slot, error) {
+	body, err := json.Marshal(createSlotRequest{SlotID: slotID, ContestantID: contestantID, Image: image, Ports: ports, OrderBand: orderBand})
 	if err != nil {
 		return nil, fmt.Errorf("marshal create slot: %w", err)
 	}

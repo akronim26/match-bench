@@ -29,6 +29,8 @@ pub struct Config {
     pub telemetry_channel_capacity: usize,
     pub max_bots_per_worker: usize,
     pub max_poll_interval: Duration,
+    pub max_inflight_per_task: usize,
+    pub write_batch: usize,
 }
 
 pub const DEFAULT_MAX_POLL_INTERVAL: Duration = Duration::from_millis(1_800_000);
@@ -52,6 +54,8 @@ impl Default for Config {
             telemetry_channel_capacity: 65536,
             max_bots_per_worker: 1000,
             max_poll_interval: DEFAULT_MAX_POLL_INTERVAL,
+            max_inflight_per_task: 10_000,
+            write_batch: 64,
         }
     }
 }
@@ -100,6 +104,16 @@ impl Config {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(Duration::from_millis)
                 .unwrap_or(default.max_poll_interval),
+            max_inflight_per_task: env::var("BOT_MAX_INFLIGHT_PER_TASK")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or(default.max_inflight_per_task),
+            write_batch: env::var("BOT_WRITE_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or(default.write_batch),
         }
     }
 
@@ -198,6 +212,46 @@ mod tests {
             "default poll interval {DEFAULT_MAX_POLL_INTERVAL:?} must exceed the ramp worst case {ramp_worst_case:?}"
         );
         assert_eq!(DEFAULT_MAX_POLL_INTERVAL, Duration::from_millis(1_800_000));
+    }
+
+    #[test]
+    /// default_inflight_and_write_batch_match_prior_hardcoded_worker_defaults ensures
+    /// moving BOT_MAX_INFLIGHT_PER_TASK / BOT_WRITE_BATCH into Config::from_env (QoL-2)
+    /// keeps the same defaults the worker.rs LazyLocks had (10_000 / 64).
+    fn default_inflight_and_write_batch_match_prior_hardcoded_worker_defaults() {
+        let config = Config::default();
+        assert_eq!(config.max_inflight_per_task, 10_000);
+        assert_eq!(config.write_batch, 64);
+    }
+
+    #[test]
+    /// from_env_reads_max_inflight_and_write_batch_and_rejects_zero mirrors the
+    /// `.filter(|&n| n >= 1)` guard the worker LazyLocks used to apply themselves.
+    fn from_env_reads_max_inflight_and_write_batch_and_rejects_zero() {
+        // SAFETY: test-only env mutation; serial within this process's test binary.
+        unsafe {
+            env::set_var("BOT_MAX_INFLIGHT_PER_TASK", "500");
+            env::set_var("BOT_WRITE_BATCH", "8");
+        }
+        let config = Config::from_env();
+        assert_eq!(config.max_inflight_per_task, 500);
+        assert_eq!(config.write_batch, 8);
+
+        unsafe {
+            env::set_var("BOT_MAX_INFLIGHT_PER_TASK", "0");
+            env::set_var("BOT_WRITE_BATCH", "0");
+        }
+        let config = Config::from_env();
+        assert_eq!(
+            config.max_inflight_per_task,
+            Config::default().max_inflight_per_task
+        );
+        assert_eq!(config.write_batch, Config::default().write_batch);
+
+        unsafe {
+            env::remove_var("BOT_MAX_INFLIGHT_PER_TASK");
+            env::remove_var("BOT_WRITE_BATCH");
+        }
     }
 
     #[test]

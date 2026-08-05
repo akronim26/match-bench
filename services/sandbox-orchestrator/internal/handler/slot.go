@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/iicpc/libs/metrics"
+	"github.com/iicpc/schemas/topics"
 	cerrs "github.com/iicpc/sandbox-orchestrator/internal/errors"
 	"github.com/iicpc/sandbox-orchestrator/internal/k8s"
 	"github.com/iicpc/sandbox-orchestrator/internal/store"
@@ -25,7 +26,39 @@ type createSlotRequest struct {
 	SlotID       string `json:"slot_id"`
 	ContestantID string `json:"contestant_id"` // stamped onto the eBPF capture's latency events
 	Image        string `json:"image"`
-	Port         int    `json:"port"`
+	Port         int    `json:"port,omitempty"`  // back-compat single-port slot; ignored if Ports is set
+	Ports        []int  `json:"ports,omitempty"` // one ContainerPort/ServicePort per entry
+
+	// OrderBand is the session's leased exclusive orders.acked partition
+	// band, threaded onto the capture container as ORDER_BAND. A pointer so
+	// the JSON zero value (0) can be told apart from "field omitted" — 0 is
+	// a legitimate band index, so a plain uint32 would silently misread an
+	// absent field as band 0. Callers that don't set it (or send explicit
+	// null) get topics.OrderBandUnset, the same sentinel bot-fleet-controller
+	// and schemas/{go,rust} use for "fall back to hash-derived banding".
+	OrderBand *uint32 `json:"order_band"`
+}
+
+// orderBand resolves the request's order band, defaulting to
+// topics.OrderBandUnset when the field was omitted or explicitly null.
+func (r createSlotRequest) orderBand() uint32 {
+	if r.OrderBand == nil {
+		return topics.OrderBandUnset
+	}
+	return *r.OrderBand
+}
+
+// resolvePorts normalizes a createSlotRequest onto its declared port list:
+// Ports if set, otherwise a single-entry list built from Port so old
+// single-port callers keep working unchanged.
+func (r createSlotRequest) resolvePorts() []int {
+	if len(r.Ports) > 0 {
+		return r.Ports
+	}
+	if r.Port > 0 {
+		return []int{r.Port}
+	}
+	return nil
 }
 
 // slotResponse groups the state and dependencies used by this package.
@@ -40,8 +73,9 @@ type slotResponse struct {
 // endpointJSON groups the state and dependencies used by this package.
 // Keep this type aligned with the runtime contract around it.
 type endpointJSON struct {
-	Host string `json:"host"`
-	Port int    `json:"port"`
+	Host  string `json:"host"`
+	Port  int    `json:"port"`
+	Ports []int  `json:"ports,omitempty"`
 }
 
 // CreateSlot performs the package-specific operation described by its name.
@@ -53,9 +87,16 @@ func CreateSlot(mgr *k8s.Manager, slots *store.SlotStore, log *slog.Logger) http
 			writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 			return
 		}
-		if req.SlotID == "" || req.Image == "" || req.Port <= 0 {
-			writeError(w, http.StatusBadRequest, "slot_id, image, and port are required")
+		ports := req.resolvePorts()
+		if req.SlotID == "" || req.Image == "" || len(ports) == 0 {
+			writeError(w, http.StatusBadRequest, "slot_id, image, and port (or ports) are required")
 			return
+		}
+		for _, p := range ports {
+			if p <= 0 {
+				writeError(w, http.StatusBadRequest, "ports must be positive")
+				return
+			}
 		}
 
 		ctx := r.Context()
@@ -79,7 +120,7 @@ func CreateSlot(mgr *k8s.Manager, slots *store.SlotStore, log *slog.Logger) http
 		}
 
 		start := time.Now()
-		if err := mgr.CreateSlot(ctx, req.SlotID, req.ContestantID, req.Image, req.Port); err != nil {
+		if err := mgr.CreateSlot(ctx, req.SlotID, req.ContestantID, req.Image, ports, req.orderBand()); err != nil {
 			metrics.Histogram("slot_create_duration_seconds", "Sandbox slot create duration in seconds.", metrics.Labels("result", "error"), metrics.SinceSeconds(start))
 			switch {
 			case errors.Is(err, cerrs.ErrSlotImageMismatch):
@@ -100,15 +141,16 @@ func CreateSlot(mgr *k8s.Manager, slots *store.SlotStore, log *slog.Logger) http
 		slot := &store.Slot{
 			SlotID:    req.SlotID,
 			Image:     req.Image,
-			Port:      req.Port,
+			Port:      ports[0],
+			Ports:     ports,
 			State:     state,
 			Message:   msg,
-			Endpoint:  store.Endpoint{Host: k8s.ServiceFQDN(req.SlotID, mgr.Namespace()), Port: req.Port},
+			Endpoint:  store.Endpoint{Host: k8s.ServiceFQDN(req.SlotID, mgr.Namespace()), Port: ports[0]},
 			CreatedAt: time.Now().UTC(),
 		}
 		slots.Put(slot)
 		recordSlot("create", "ok", string(state))
-		log.InfoContext(ctx, "slot created", "slot_id", req.SlotID, "image", req.Image, "port", req.Port)
+		log.InfoContext(ctx, "slot created", "slot_id", req.SlotID, "image", req.Image, "ports", ports)
 		writeJSON(w, http.StatusCreated, toResponse(slot))
 	}
 }
@@ -198,8 +240,9 @@ func toResponse(slot *store.Slot) slotResponse {
 		State:   string(slot.State),
 		Message: slot.Message,
 		Endpoint: endpointJSON{
-			Host: slot.Endpoint.Host,
-			Port: slot.Endpoint.Port,
+			Host:  slot.Endpoint.Host,
+			Port:  slot.Endpoint.Port,
+			Ports: slot.Ports,
 		},
 	}
 }

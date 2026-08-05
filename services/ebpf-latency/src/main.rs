@@ -5,6 +5,9 @@
 //! The comments in this file describe public structure and callable behavior.
 
 mod capture;
+mod cpu;
+#[cfg(test)]
+mod framing_property;
 mod matcher;
 mod mtu;
 mod netns;
@@ -26,7 +29,8 @@ use aya::{
 use iicpc_bot_fleet::kafka::{self, KafkaProducer};
 use iicpc_logger_rust::loki;
 use iicpc_schemas_rust::{
-    partition_for, OrderAckedBatchRef, OrderAckedEventRef, TOPIC_ORDERS_ACKED,
+    band_partition, session_band_partition, OrderAckedBatchRef, OrderAckedEventRef,
+    DEFAULT_PARTITION_BAND_WIDTH, ORDER_BAND_UNSET, TOPIC_ORDERS_ACKED,
 };
 use std::collections::BTreeMap;
 use tokio::signal::unix::{signal, Signal, SignalKind};
@@ -41,13 +45,29 @@ use pipeline::Pipeline;
 const DEFAULT_RINGBUF_MAP: &str = "EVENTS";
 const DROPPED_EVENTS_MAP: &str = "DROPPED_EVENTS";
 const TRUNCATED_CAPTURES_MAP: &str = "TRUNCATED_CAPTURES";
+const XDP_PACKETS_MAP: &str = "XDP_PACKETS";
+const TC_PACKETS_MAP: &str = "TC_PACKETS";
+const XDP_LOAD_FAILED_MAP: &str = "XDP_LOAD_FAILED";
+const TC_LOAD_FAILED_MAP: &str = "TC_LOAD_FAILED";
+const SHORT_PAYLOAD_MAP: &str = "SHORT_PAYLOAD";
 const DEFAULT_XDP_INGRESS_PROGRAM: &str = "iicpc_xdp_ingress";
 const DEFAULT_TC_EGRESS_PROGRAM: &str = "iicpc_tc_egress";
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(5);
 const DEFAULT_BATCH_SIZE: usize = 4096;
 const EVICT_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_EVENTS_PER_BATCH: usize = 1000;
-const DEFAULT_CLAMP_MTU: usize = 1500;
+// 9001 (was 1500): with CAPTURE_CAP at 9029 a full jumbo frame fits one
+// capture record, so the MTU clamp that de-optimised the whole grading path
+// (~6x packet count, docs/grading-network-regime.md) is no longer needed to
+// keep the capture complete. gso_max_size still clamps to this value —
+// pre-GSO skbs at the tc hook must stay within one record — and clamp_to only
+// ever lowers an interface MTU, so on a 1500-MTU local veth this is a no-op.
+// CAPTURE_CLAMP_MTU=1500 remains the rollback lever.
+const DEFAULT_CLAMP_MTU: usize = 9001;
+/// How long to wait at shutdown for the producer queue to reach the broker. Must stay
+/// below the pod's terminationGracePeriodSeconds or the SIGKILL lands mid-drain and the
+/// flush achieves nothing.
+const PRODUCER_FLUSH_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Clone)]
 /// Config stores the state passed across this module boundary.
@@ -67,6 +87,13 @@ struct Config {
     batch_size: usize,
     clamp_mtu: usize,
     orders_partitions: i32,
+    partition_band_width: i32,
+    // order_band is the session's exclusively-leased orders.acked partition
+    // band (set by sandbox-orchestrator's ORDER_BAND env var, itself sourced
+    // from bot-fleet-controller's per-session lease). ORDER_BAND_UNSET
+    // (u32::MAX) means unassigned — fall back to hash-derived
+    // session_band_partition for back-compat with pre-leasing rollout.
+    order_band: u32,
 }
 
 impl Config {
@@ -109,6 +136,15 @@ impl Config {
             batch_size: env_usize("EBPF_BATCH_SIZE", DEFAULT_BATCH_SIZE),
             clamp_mtu: env_usize("CAPTURE_CLAMP_MTU", DEFAULT_CLAMP_MTU),
             orders_partitions: env_usize("ORDERS_PARTITIONS", 24).max(1) as i32,
+            partition_band_width: env_usize(
+                "BOT_PARTITION_BAND_WIDTH",
+                DEFAULT_PARTITION_BAND_WIDTH as usize,
+            )
+            .max(1) as i32,
+            order_band: env::var("ORDER_BAND")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(ORDER_BAND_UNSET),
         })
     }
 
@@ -159,6 +195,16 @@ async fn run(config: Config, producer: KafkaProducer) -> Result<()> {
     .with_context(|| format!("open ringbuf map {}", config.ringbuf_map))?;
     let dropped_events = take_counter(&mut bpf, DROPPED_EVENTS_MAP);
     let truncated_captures = take_counter(&mut bpf, TRUNCATED_CAPTURES_MAP);
+    let xdp_packets = take_counter(&mut bpf, XDP_PACKETS_MAP);
+    let tc_packets = take_counter(&mut bpf, TC_PACKETS_MAP);
+    let xdp_load_failed = take_counter(&mut bpf, XDP_LOAD_FAILED_MAP);
+    let tc_load_failed = take_counter(&mut bpf, TC_LOAD_FAILED_MAP);
+    let short_payload = take_counter(&mut bpf, SHORT_PAYLOAD_MAP);
+    let mut last_xdp_packets = 0u64;
+    let mut last_tc_packets = 0u64;
+    let mut last_xdp_load_failed = 0u64;
+    let mut last_tc_load_failed = 0u64;
+    let mut last_short_payload = 0u64;
 
     info!(
         iface = %config.iface,
@@ -178,13 +224,73 @@ async fn run(config: Config, producer: KafkaProducer) -> Result<()> {
     let mut decoded_total = 0u64;
     let mut last_decoded = 0u64;
     let mut stats_tick = 0u64;
+    let mut cpu_sampler = cpu::CpuSampler::new();
     let mut shutdown = ShutdownSignal::new()?;
 
     loop {
         tokio::select! {
             sig = shutdown.recv() => {
                 info!(signal = sig, "shutdown signal received; flushing buffered orders.acked tail");
+                // Drain the ring buffer one last time: records captured since the last
+                // tick are still in it, and exiting here would discard them.
+                decoded_total += drain_ringbuf(&mut ringbuf, &mut pipeline, &producer, &config, &mut events);
                 flush(&producer, &config, &mut events);
+                // flush() only ENQUEUES. Without the wait below, everything still in the
+                // producer queue is discarded when this function returns — which is
+                // invisible, because enqueue is fire-and-forget and nothing inspects
+                // delivery reports.
+                let queued = kafka::in_flight_count(&producer);
+                info!(queued, decoded_total, "draining producer queue before exit");
+                let left = kafka::flush_producer(&producer, PRODUCER_FLUSH_TIMEOUT).unwrap_or(queued);
+                if left > 0 {
+                    metrics::undelivered_at_exit(left as u64);
+                    warn!(
+                        undelivered = left,
+                        timeout_s = PRODUCER_FLUSH_TIMEOUT.as_secs(),
+                        "producer queue did NOT drain within the flush timeout; these orders.acked records are lost and their orders will look unanswered"
+                    );
+                } else {
+                    info!("producer queue fully delivered before exit");
+                }
+                // FINAL totals, logged rather than left to a scrape.
+                //
+                // Every counter here is also exported to Prometheus, but the capture runs as
+                // a per-run Job whose pod is reaped on completion, and a ~50s life scraped
+                // every 15s loses whatever accumulated after the last scrape. That is not
+                // hypothetical: one run's funnel reported 3.01M records emitted against
+                // 4.11M events decoded — an impossibility that is purely an artefact of the
+                // missing final scrape, and which made several cross-run comparisons
+                // unreliable before anyone noticed. These lines are the authoritative
+                // numbers for a session; the time series is only for shape.
+                // Re-read the kernel counter rather than reusing the last reported value:
+                // records dropped between the final tick and shutdown are exactly the ones
+                // a scrape would miss, and they are the ones worth knowing about.
+                let ringbuf_dropped_final = dropped_events
+                    .as_ref()
+                    .map(read_counter)
+                    .unwrap_or(last_dropped);
+                let (thr_periods, thr_usec) = cpu::read_throttling()
+                    .map(|t| (t.nr_throttled, t.throttled_usec))
+                    .unwrap_or((0, 0));
+                info!(
+                    decoded_total,
+                    ringbuf_dropped = ringbuf_dropped_final,
+                    cpu_throttled_periods = thr_periods,
+                    cpu_throttled_ms = thr_usec / 1_000,
+                    hold_overflows = pipeline.hold_overflows,
+                    buffer_overflows = pipeline.buffer_overflows,
+                    truncation_resets = pipeline.truncation_resets,
+                    resync_skipped_bytes = pipeline.resync_skipped_bytes,
+                    stream_gap_bytes = pipeline.stream_gap_bytes,
+                    retransmitted_bytes = pipeline.retransmitted_bytes,
+                    ws_compressed_frames = pipeline.ws_compressed_frames,
+                    framed_requests = pipeline.framed_requests,
+                    framed_responses = pipeline.framed_responses,
+                    framed_no_clordid = pipeline.framed_no_clordid,
+                    unmatched_responses = pipeline.unmatched_responses(),
+                    evicted_idle = pipeline.evicted_idle(),
+                    "eBPF capture FINAL counters"
+                );
                 return Ok(());
             }
             _ = ticker.tick() => {
@@ -194,6 +300,46 @@ async fn run(config: Config, producer: KafkaProducer) -> Result<()> {
                 // (both directions), unmatched_responses = responses seen with no prior request
                 // capture to pair against, pending = matched events buffered for the next flush.
                 stats_tick += 1;
+                // Sample CPU on the same cadence as the stats log rather than every flush:
+                // reading /proc/self/task is cheap but not free, and a profiler that
+                // measurably slows the thing it measures answers the wrong question.
+                if stats_tick % 10 == 0 {
+                    let (threads, total) = cpu_sampler.sample();
+                    if !threads.is_empty() {
+                        metrics::process_cpu(total);
+                        for t in &threads {
+                            metrics::thread_cpu(&t.name, t.percent);
+                        }
+                        // Logged as well as exported: the capture Job is per-run and its
+                        // pod is reaped on completion, so a scrape can miss the window
+                        // entirely. The log survives in the Job's output.
+                        let top: Vec<String> = threads
+                            .iter()
+                            .take(4)
+                            .map(|t| format!("{}={:.0}%", t.name, t.percent))
+                            .collect();
+                        // Throttling alongside CPU, because the two answer different
+                        // questions: high CPU says the capture is working hard, throttled
+                        // periods say it was STOPPED while work was pending. The container
+                        // is Burstable (requests 200m, limits 4), so on a busy node it can
+                        // be squeezed toward its request — and a 2-core cap causing exactly
+                        // these ringbuf drops is already on record in slot.go.
+                        let (thr_periods, thr_usec) = match cpu::read_throttling() {
+                            Some(t) => {
+                                metrics::cpu_throttling(t.nr_throttled, t.throttled_usec);
+                                (t.nr_throttled, t.throttled_usec)
+                            }
+                            None => (0, 0),
+                        };
+                        info!(
+                            process_cpu_percent = format!("{total:.0}"),
+                            top_threads = %top.join(" "),
+                            throttled_periods = thr_periods,
+                            throttled_ms = thr_usec / 1_000,
+                            "eBPF capture CPU"
+                        );
+                    }
+                }
                 if stats_tick % 10 == 0 && decoded_total != last_decoded {
                     info!(
                         decoded = decoded_total,
@@ -203,8 +349,45 @@ async fn run(config: Config, producer: KafkaProducer) -> Result<()> {
                     );
                     last_decoded = decoded_total;
                 }
-                report_counter(&dropped_events, &mut last_dropped, "eBPF ring buffer dropped events");
-                report_counter(&truncated_captures, &mut last_truncated, "eBPF truncated oversized captures (check GSO/TSO off)");
+                {
+                    // Attribute every path that can silently discard a FIX message. These
+                    // are what remains between a healthy capture and capture_gaps == 0:
+                    // an order whose records are lost here is absent from the reference
+                    // book, so it damages not just its own grading but every later fill
+                    // that trades against the liquidity it should have provided.
+                    metrics::stream_loss("hold_overflow", pipeline.hold_overflows, &metrics::LAST_HOLD_OVERFLOW);
+                    metrics::stream_loss("buffer_overflow", pipeline.buffer_overflows, &metrics::LAST_BUFFER_OVERFLOW);
+                    metrics::stream_loss("truncation_reset", pipeline.truncation_resets, &metrics::LAST_TRUNCATION_RESET);
+                    metrics::stream_loss("resync_skipped_bytes", pipeline.resync_skipped_bytes, &metrics::LAST_RESYNC_BYTES);
+                    metrics::stream_loss("ws_compressed_frame", pipeline.ws_compressed_frames, &metrics::LAST_WS_COMPRESSED);
+                    metrics::stream_loss("retransmitted_bytes", pipeline.retransmitted_bytes, &metrics::LAST_RETRANSMITTED_BYTES);
+                    metrics::stream_loss("unmatched_response", pipeline.unmatched_responses(), &metrics::LAST_UNMATCHED);
+                    metrics::stream_loss("matcher_evicted_unanswered", pipeline.evicted_idle(), &metrics::LAST_EVICTED_IDLE);
+                    metrics::stream_loss("framed_no_clordid", pipeline.framed_no_clordid, &metrics::LAST_NO_CLORDID);
+                    metrics::stream_loss("stream_gap_bytes", pipeline.stream_gap_bytes, &metrics::LAST_STREAM_GAP);
+                    // Queue depth: the volume that would be lost if the pod were killed
+                    // right now. This is the measurement that tells us whether the
+                    // producer, not the capture, is where a session's records go missing.
+                    metrics::producer_inflight(kafka::in_flight_count(&producer) as i64);
+                    // The capture funnel, kernel first. A packet counted here that never
+                    // becomes a framed message is a hole in the byte stream, and a hole on
+                    // the REQUEST side costs the whole order: with no inflight entry, both
+                    // of its responses arrive unmatchable and are discarded.
+                    funnel(&xdp_packets, &mut last_xdp_packets, "xdp_packets");
+                    funnel(&tc_packets, &mut last_tc_packets, "tc_packets");
+                    funnel(&short_payload, &mut last_short_payload, "short_payload_skipped");
+                    report_counter(&xdp_load_failed, &mut last_xdp_load_failed, "XDP load_bytes FAILED; request packet dropped with no record", metrics::xdp_load_failed);
+                    report_counter(&tc_load_failed, &mut last_tc_load_failed, "tc load_bytes FAILED; response packet dropped with no record", metrics::tc_load_failed);
+                    metrics::framed("request", pipeline.framed_requests, &metrics::LAST_FRAMED_REQ);
+                    metrics::framed("response", pipeline.framed_responses, &metrics::LAST_FRAMED_RESP);
+                    metrics::stream_loss("matcher_evicted_capacity", pipeline.evicted_capacity(), &metrics::LAST_EVICTED_CAPACITY);
+                }
+                report_counter(&dropped_events, &mut last_dropped, "eBPF ring buffer dropped events", metrics::ringbuf_dropped);
+                // Not "check GSO/TSO off": ethtool feature flags govern on-wire framing,
+                // while the tc egress hook runs before segmentation and sees the whole
+                // pre-segmentation skb regardless. A non-zero total here means orders are
+                // losing their responses wholesale — see clamp_gso.
+                report_counter(&truncated_captures, &mut last_truncated, "eBPF truncated oversized captures; responses past the capture cap are LOST (check gso_max_size clamp)", metrics::truncated_captures);
             }
             _ = evict_ticker.tick() => {
                 pipeline.evict_idle();
@@ -278,16 +461,37 @@ fn drain_ringbuf(
 // batch_by_partition drains `events` into per-partition chunks (co-partitioned by
 // order_id so each order's acked event lands on the same partition the worker's
 // sent event did), each chunk <= MAX_EVENTS_PER_BATCH. Pure + unit-tested.
+//
+// When `order_band` != ORDER_BAND_UNSET, the session holds an exclusive
+// controller-leased band and partitioning goes through `band_partition`
+// (deterministic within that band, no cross-session collisions possible).
+// Otherwise it falls back to the old hash-derived `session_band_partition`
+// path, kept for back-compat during rollout / unleased sessions.
 fn batch_by_partition(
     events: &mut Vec<MatchedEvent>,
+    session_id: &str,
     orders_partitions: i32,
+    partition_band_width: i32,
+    order_band: u32,
 ) -> Vec<(i32, Vec<MatchedEvent>)> {
     let mut by_part: BTreeMap<i32, Vec<MatchedEvent>> = BTreeMap::new();
     for e in events.drain(..) {
-        by_part
-            .entry(partition_for(&e.order_id, orders_partitions))
-            .or_default()
-            .push(e);
+        let partition = if order_band != ORDER_BAND_UNSET {
+            band_partition(
+                order_band,
+                &e.order_id,
+                orders_partitions,
+                partition_band_width,
+            )
+        } else {
+            session_band_partition(
+                session_id,
+                &e.order_id,
+                orders_partitions,
+                partition_band_width,
+            )
+        };
+        by_part.entry(partition).or_default().push(e);
     }
     let mut out = Vec::new();
     for (part, mut group) in by_part {
@@ -310,7 +514,13 @@ fn flush(producer: &KafkaProducer, config: &Config, events: &mut Vec<MatchedEven
     if events.is_empty() {
         return;
     }
-    for (part, chunk) in batch_by_partition(events, config.orders_partitions) {
+    for (part, chunk) in batch_by_partition(
+        events,
+        &config.session_id,
+        config.orders_partitions,
+        config.partition_band_width,
+        config.order_band,
+    ) {
         let event_refs = chunk
             .iter()
             .map(|e| OrderAckedEventRef {
@@ -398,14 +608,37 @@ fn read_counter(map: &PerCpuArray<MapData, u64>) -> u64 {
         .unwrap_or(0)
 }
 
-/// report_counter performs the module-specific operation described by its name.
-/// It keeps validation, side effects, and returned values within this module's contract.
-fn report_counter(map: &Option<PerCpuArray<MapData, u64>>, last: &mut u64, msg: &str) {
+/// report_counter mirrors one kernel-side PerCpuArray counter into its OWN Prometheus
+/// counter and warns on each increase.
+///
+/// `sink` is a parameter because it used to be hardcoded to metrics::ringbuf_dropped for
+/// every caller: truncated captures were published as ring-buffer drops, and since each
+/// sink keeps a single "last total seen" cell, two different absolute totals swapping
+/// through the same cell corrupted both. That is why a run with 894 truncations reported
+/// 759 ring-buffer drops and no truncation metric at all.
+fn report_counter(
+    map: &Option<PerCpuArray<MapData, u64>>,
+    last: &mut u64,
+    msg: &str,
+    sink: fn(u64),
+) {
     if let Some(map) = map {
         let total = read_counter(map);
         if total > *last {
-            metrics::ringbuf_dropped(total);
+            sink(total);
             warn!(total, delta = total - *last, "{msg}");
+        }
+        *last = total;
+    }
+}
+
+/// funnel mirrors a kernel-side absolute counter into the capture-funnel metric without
+/// warning on it — these are totals, not losses.
+fn funnel(map: &Option<PerCpuArray<MapData, u64>>, last: &mut u64, stage: &'static str) {
+    if let Some(map) = map {
+        let total = read_counter(map);
+        if total > *last {
+            metrics::capture_funnel(stage, total - *last);
         }
         *last = total;
     }
@@ -416,6 +649,7 @@ fn report_counter(map: &Option<PerCpuArray<MapData, u64>>, last: &mut u64, msg: 
 fn attach_programs(bpf: &mut Ebpf, config: &Config) -> Result<()> {
     let mut attach = || -> Result<()> {
         disable_offloads(&config.iface);
+        clamp_gso(&config.iface, config.clamp_mtu);
         mtu::clamp_to(&config.iface, config.clamp_mtu);
         attach_xdp_ingress(bpf, &config.xdp_ingress_program, &config.iface)?;
         attach_tc_egress(bpf, &config.tc_egress_program, &config.iface)
@@ -424,6 +658,71 @@ fn attach_programs(bpf: &mut Ebpf, config: &Config) -> Result<()> {
         return with_network_namespace(netns_path, attach);
     }
     attach()
+}
+
+/// gso_clamp_args builds the `ip link` arguments that bound how large an skb the stack
+/// may build for this interface.
+///
+/// This is the setting that actually governs what the capture sees, and it is NOT the
+/// same as `ethtool -K gso off`. The tc egress hook runs in __dev_queue_xmit BEFORE GSO
+/// segmentation, so it observes the pre-segmentation skb — up to 64KiB when the engine
+/// coalesces responses — no matter what the device's offload feature flags say. The BPF
+/// program can only copy COPY_CAP (1536) bytes of it, so every FIX message past the
+/// leading ~11 was discarded: measured at 894 truncated packets costing 459,363 of
+/// 1,791,744 orders (25.6%) their entire response record, against an engine that had in
+/// fact answered 100% of them. gso_max_size/gso_max_segs are enforced where the skb is
+/// built, upstream of the hook, so clamping them is what makes truncation impossible
+/// rather than merely rarer.
+///
+/// gso_max_segs is pinned to 1 as well: gso_max_size alone still permits a multi-segment
+/// skb whose total payload exceeds the cap.
+fn gso_clamp_args(iface: &str, max_size: usize) -> Vec<String> {
+    vec![
+        "link".into(),
+        "set".into(),
+        "dev".into(),
+        iface.into(),
+        "gso_max_size".into(),
+        max_size.to_string(),
+        "gso_max_segs".into(),
+        "1".into(),
+    ]
+}
+
+/// clamp_gso bounds skb construction on the capture interface so the tc egress hook
+/// never sees a payload larger than the BPF program can copy. See gso_clamp_args.
+fn clamp_gso(iface: &str, clamp: usize) {
+    if clamp == 0 {
+        info!(iface, "capture GSO clamp disabled (CAPTURE_CLAMP_MTU=0)");
+        return;
+    }
+    let args = gso_clamp_args(iface, clamp);
+    match std::process::Command::new("ip").args(&args).output() {
+        Ok(out) if out.status.success() => {
+            info!(
+                iface,
+                gso_max_size = clamp,
+                gso_max_segs = 1,
+                "clamped GSO sizing on capture interface"
+            );
+        }
+        Ok(out) => {
+            warn!(
+                iface,
+                clamp,
+                detail = %String::from_utf8_lossy(&out.stderr).trim(),
+                "FAILED to clamp GSO sizing; coalesced responses will be truncated at the capture cap and their orders will look unanswered"
+            );
+        }
+        Err(err) => {
+            warn!(
+                iface,
+                clamp,
+                error = %err,
+                "failed to run ip link; GSO sizing unclamped, coalesced responses will be truncated"
+            );
+        }
+    }
 }
 
 /// disable_offloads performs the module-specific operation described by its name.
@@ -607,6 +906,66 @@ mod tests {
     use iicpc_schemas_rust::OrderAckedBatch;
     use std::sync::{Mutex, OnceLock};
 
+    /// gso_clamp_args_bounds_both_size_and_segs pins the clamp that keeps coalesced
+    /// responses inside the BPF capture cap. Both knobs are required: gso_max_size alone
+    /// still permits a multi-segment skb whose total payload exceeds the cap, and neither
+    /// is implied by `ethtool -K gso off` (that governs on-wire framing, while the tc
+    /// egress hook runs before segmentation).
+    #[test]
+    fn gso_clamp_args_bounds_both_size_and_segs() {
+        let args = gso_clamp_args("eth0", 1500);
+        assert_eq!(
+            args,
+            vec![
+                "link",
+                "set",
+                "dev",
+                "eth0",
+                "gso_max_size",
+                "1500",
+                "gso_max_segs",
+                "1"
+            ]
+        );
+    }
+
+    /// gso_clamp_target_tracks_the_capture_cap: the clamp must not exceed what the BPF
+    /// program can copy in one record, or truncation returns.
+    #[test]
+    fn gso_clamp_target_tracks_the_capture_cap() {
+        for mtu in [1500usize, 1400, 9000, DEFAULT_CLAMP_MTU] {
+            let args = gso_clamp_args("eth0", mtu);
+            let size: usize = args[5].parse().unwrap();
+            if mtu <= capture::CAPTURE_CAP {
+                assert!(
+                    size <= capture::CAPTURE_CAP,
+                    "clamp {size} exceeds the {}-byte capture cap",
+                    capture::CAPTURE_CAP
+                );
+            }
+            assert_eq!(args[7], "1", "gso_max_segs must pin to one segment");
+        }
+    }
+
+    /// The DEFAULT clamp and the capture cap must stay compatible: a pre-GSO
+    /// skb bounded by gso_max_size = DEFAULT_CLAMP_MTU carries at most
+    /// MTU - 40 bytes of TCP payload, and every one of those bytes must fit a
+    /// single capture record or truncation (25.6% response loss, 2026-07-31)
+    /// silently returns. 9029 = 9001 + 28 covers a full jumbo frame plus the
+    /// record header, which is what lets EKS keep MTU 9001 (the kernel-side
+    /// constant in ebpf.rs and this mirror move in lockstep — capture.rs's
+    /// decode rejects captured_len above the mirror, so a stale mirror would
+    /// discard every complete jumbo capture as corrupt).
+    #[test]
+    fn default_clamp_fits_the_capture_cap() {
+        assert_eq!(capture::CAPTURE_CAP, 9029);
+        assert_eq!(DEFAULT_CLAMP_MTU, 9001);
+        assert!(DEFAULT_CLAMP_MTU <= capture::CAPTURE_CAP);
+        // Per-CPU scratch value: header + cap must fit the 32KB
+        // PCPU_MIN_UNIT_SIZE bound on per-CPU map values.
+        assert!(capture::CAPTURE_HEADER_LEN + capture::CAPTURE_CAP <= 32 * 1024);
+    }
+
     fn mk_event(order_id: &str) -> MatchedEvent {
         MatchedEvent {
             order_id: order_id.to_string(),
@@ -632,9 +991,11 @@ mod tests {
     #[test]
     fn batch_by_partition_drains_all_events_chunked_and_co_partitioned() {
         let n = 8i32;
+        let band_width = DEFAULT_PARTITION_BAND_WIDTH;
+        let session_id = "sess-test";
         let mut events: Vec<MatchedEvent> =
             (0..2500).map(|i| mk_event(&format!("ord-{i}"))).collect();
-        let batches = batch_by_partition(&mut events, n);
+        let batches = batch_by_partition(&mut events, session_id, n, band_width, ORDER_BAND_UNSET);
 
         assert!(events.is_empty(), "events must be fully drained");
         let total: usize = batches.iter().map(|(_, c)| c.len()).sum();
@@ -647,18 +1008,117 @@ mod tests {
             );
             for e in chunk {
                 assert_eq!(
-                    partition_for(&e.order_id, n),
+                    session_band_partition(session_id, &e.order_id, n, band_width),
                     *part,
-                    "co-partitioned by order_id"
+                    "co-partitioned by session_id+order_id"
                 );
             }
         }
     }
 
+    /// batch_by_partition_matches_bot_fleet_sender_partition pins the CRITICAL
+    /// cross-topic invariant: an order's orders.acked partition (computed here)
+    /// must equal its orders.sent partition (computed by bot-fleet's
+    /// PartitionBatcher via the same `session_band_partition` function), so a
+    /// consumer joining sent+acked by order_id can rely on both landing on the
+    /// same partition.
+    #[test]
+    fn batch_by_partition_matches_bot_fleet_sender_partition() {
+        let n = 24i32;
+        let band_width = DEFAULT_PARTITION_BAND_WIDTH;
+        let session_id = "01890dd2-71f3-7abc-9def-0123456789ab";
+        let order_id = "01890dd2-71f3-7abc-9def-0123456789ab_42_7_O";
+
+        let mut events = vec![mk_event(order_id)];
+        let batches = batch_by_partition(&mut events, session_id, n, band_width, ORDER_BAND_UNSET);
+        let (acked_partition, _) = &batches[0];
+
+        let sent_partition = session_band_partition(session_id, order_id, n, band_width);
+        assert_eq!(
+            *acked_partition, sent_partition,
+            "orders.acked and orders.sent must land on the same partition for the same order"
+        );
+    }
+
     #[test]
     fn batch_by_partition_empty_is_empty() {
         let mut events: Vec<MatchedEvent> = Vec::new();
-        assert!(batch_by_partition(&mut events, 24).is_empty());
+        assert!(batch_by_partition(
+            &mut events,
+            "sess",
+            24,
+            DEFAULT_PARTITION_BAND_WIDTH,
+            ORDER_BAND_UNSET
+        )
+        .is_empty());
+    }
+
+    // When a band is leased (order_band != ORDER_BAND_UNSET), partitioning must go
+    // through band_partition rather than the hash-derived session_band_partition —
+    // this is the whole point of exclusive per-session leasing.
+    #[test]
+    fn batch_by_partition_uses_band_partition_when_band_is_set() {
+        let n = 24i32;
+        let band_width = DEFAULT_PARTITION_BAND_WIDTH;
+        let band = 2u32;
+        let session_id = "sess-band-test";
+        let mut events: Vec<MatchedEvent> =
+            (0..50).map(|i| mk_event(&format!("ord-{i}"))).collect();
+        let expected: Vec<(String, i32)> = events
+            .iter()
+            .map(|e| {
+                (
+                    e.order_id.clone(),
+                    band_partition(band, &e.order_id, n, band_width),
+                )
+            })
+            .collect();
+
+        let batches = batch_by_partition(&mut events, session_id, n, band_width, band);
+
+        assert!(events.is_empty(), "events must be fully drained");
+        let base = band as i32 * band_width;
+        for (part, chunk) in &batches {
+            assert!(
+                *part >= base && *part < base + band_width,
+                "partition {part} must stay within the leased band [{base}, {})",
+                base + band_width
+            );
+            for e in chunk {
+                let want = expected.iter().find(|(id, _)| id == &e.order_id).unwrap().1;
+                assert_eq!(
+                    *part, want,
+                    "must match band_partition, not the hash-derived path"
+                );
+            }
+        }
+    }
+
+    // Sanity check that band_partition and session_band_partition actually diverge
+    // for at least one order_id in this fixture — otherwise the two branches above
+    // wouldn't be distinguishable and the "uses band_partition" assertion would be
+    // vacuous.
+    #[test]
+    fn band_partition_and_session_band_partition_diverge_for_some_order() {
+        let n = 24i32;
+        let band_width = DEFAULT_PARTITION_BAND_WIDTH;
+        let band = 2u32;
+        // Any session_id whose hash-derived band != `band` will diverge from
+        // band_partition for every order_id (different base offset); try a
+        // handful so the test doesn't depend on one session_id's hash landing
+        // in the "wrong" (coincidentally matching) band.
+        let diverges = (0..20).any(|s| {
+            let session_id = format!("sess-band-test-{s}");
+            (0..10).any(|i| {
+                let order_id = format!("ord-{i}");
+                band_partition(band, &order_id, n, band_width)
+                    != session_band_partition(&session_id, &order_id, n, band_width)
+            })
+        });
+        assert!(
+            diverges,
+            "fixture must exercise a real difference between the two paths"
+        );
     }
 
     const ENV_KEYS: &[&str] = &[
@@ -676,6 +1136,7 @@ mod tests {
         "EBPF_FLUSH_INTERVAL_MS",
         "EBPF_BATCH_SIZE",
         "CAPTURE_CLAMP_MTU",
+        "ORDER_BAND",
     ];
 
     /// env_lock performs the module-specific operation described by its name.
@@ -746,6 +1207,8 @@ mod tests {
             batch_size: DEFAULT_BATCH_SIZE,
             clamp_mtu: DEFAULT_CLAMP_MTU,
             orders_partitions: 24,
+            partition_band_width: DEFAULT_PARTITION_BAND_WIDTH,
+            order_band: ORDER_BAND_UNSET,
         };
         let mut events = vec![MatchedEvent {
             order_id: format!("order-{suffix}"),
@@ -832,7 +1295,38 @@ mod tests {
         assert_eq!(config.flush_interval, DEFAULT_FLUSH_INTERVAL);
         assert_eq!(config.batch_size, DEFAULT_BATCH_SIZE);
         assert_eq!(config.clamp_mtu, DEFAULT_CLAMP_MTU);
+        assert_eq!(
+            config.order_band, ORDER_BAND_UNSET,
+            "ORDER_BAND unset must default to the sentinel, not 0"
+        );
         config.validate().unwrap();
+        clear_test_env();
+    }
+
+    #[test]
+    /// config_from_env_parses_order_band performs the module-specific operation described by its name.
+    /// It keeps validation, side effects, and returned values within this module's contract.
+    fn config_from_env_parses_order_band() {
+        let _guard = env_lock();
+        let cases: &[(Option<&str>, u32)] = &[
+            (None, ORDER_BAND_UNSET),
+            (Some(""), ORDER_BAND_UNSET),
+            (Some("not-a-number"), ORDER_BAND_UNSET),
+            (Some("0"), 0),
+            (Some("5"), 5),
+        ];
+        for &(value, want) in cases {
+            clear_test_env();
+            set_env("SESSION_ID", "session-a");
+            set_env("CONTESTANT_ID", "contestant-a");
+            set_env("EBPF_IFACE", "eth0");
+            set_env("EBPF_OBJECT_PATH", "/tmp/latency.o");
+            if let Some(v) = value {
+                set_env("ORDER_BAND", v);
+            }
+            let config = Config::from_env().unwrap();
+            assert_eq!(config.order_band, want, "ORDER_BAND={value:?}");
+        }
         clear_test_env();
     }
 

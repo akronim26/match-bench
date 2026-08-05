@@ -4,7 +4,11 @@
 //! behavior consistent with the service contracts documented in design.md.
 //! The comments in this file describe public structure and callable behavior.
 pub const CAPTURE_HEADER_LEN: usize = 28;
-pub const CAPTURE_CAP: usize = 1536;
+/// Userspace mirror of the kernel-side CAPTURE_CAP in ebpf.rs — the two move
+/// in lockstep (pinned by main.rs::default_clamp_fits_the_capture_cap).
+/// decode() rejects records claiming more than this, so a stale mirror would
+/// discard every complete jumbo capture as corrupt.
+pub const CAPTURE_CAP: usize = 9029;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Direction enumerates the states or variants handled by this module.

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/iicpc/schemas/topics"
+	storepkg "github.com/iicpc/submission-api/internal/store"
 	kafka "github.com/segmentio/kafka-go"
 )
 
@@ -32,6 +33,7 @@ func TestBenchmarkStatusConsumerIntegrationConsumesStatusFromKafka(t *testing.T)
 		strings.Join(brokers, ","),
 		"itest-submission-api-benchmark-status-"+suffix,
 		store,
+		&fakePub{},
 		slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -157,6 +159,13 @@ type recordingRunStatusStore struct {
 
 // newRecordingRunStatusStore performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
+// ClaimNextRunInGroup is a no-op here: the integration test exercises status
+// persistence, not sequential dispatch (unit-tested in
+// sequential_dispatch_test.go). Returning nil = "group fully dispatched".
+func (r *recordingRunStatusStore) ClaimNextRunInGroup(_ context.Context, _ string) (*storepkg.RunMeta, error) {
+	return nil, nil
+}
+
 func newRecordingRunStatusStore(targetSessionID string) *recordingRunStatusStore {
 	return &recordingRunStatusStore{
 		targetSessionID: targetSessionID,

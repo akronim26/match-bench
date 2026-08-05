@@ -15,6 +15,8 @@ import (
 	"github.com/iicpc/libs/metrics"
 	"github.com/iicpc/schemas/topics"
 	cerrs "github.com/iicpc/submission-api/internal/errors"
+	"github.com/iicpc/submission-api/internal/publisher"
+	"github.com/iicpc/submission-api/internal/store"
 	"github.com/iicpc/submission-api/internal/utils"
 	kafka "github.com/segmentio/kafka-go"
 )
@@ -24,19 +26,29 @@ import (
 type RunStatusStore interface {
 	UpdateRunStatus(ctx context.Context, sessionID, status, message string) error
 	RecomputeRunGroupStatus(ctx context.Context, runGroupID string) error
+	// ClaimNextRunInGroup atomically flips the group's earliest `requested`
+	// run to `queued` and returns it; nil when nothing is left to dispatch.
+	ClaimNextRunInGroup(ctx context.Context, runGroupID string) (*store.RunMeta, error)
+}
+
+// BenchmarkPublisher is the slice of publisher.Publisher this consumer needs
+// to dispatch a group's next scenario.
+type BenchmarkPublisher interface {
+	PublishBenchmarkRequested(ctx context.Context, meta publisher.BenchmarkMeta) error
 }
 
 // BenchmarkStatusConsumer groups the state and dependencies used by this package.
 // Keep this type aligned with the runtime contract around it.
 type BenchmarkStatusConsumer struct {
 	reader *kafka.Reader
+	pub    BenchmarkPublisher
 	pg     RunStatusStore
 	log    *slog.Logger
 }
 
 // NewBenchmarkStatusConsumer performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func NewBenchmarkStatusConsumer(brokers, groupID string, pg RunStatusStore, log *slog.Logger) *BenchmarkStatusConsumer {
+func NewBenchmarkStatusConsumer(brokers, groupID string, pg RunStatusStore, pub BenchmarkPublisher, log *slog.Logger) *BenchmarkStatusConsumer {
 	r := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        utils.ParseBrokers(brokers),
 		GroupID:        groupID,
@@ -46,7 +58,53 @@ func NewBenchmarkStatusConsumer(brokers, groupID string, pg RunStatusStore, log 
 		MaxWait:        100 * time.Millisecond,
 		CommitInterval: 0,
 	})
-	return &BenchmarkStatusConsumer{reader: r, pg: pg, log: log}
+	return &BenchmarkStatusConsumer{reader: r, pg: pg, pub: pub, log: log}
+}
+
+// terminalRunStatus reports whether a session status ends the run. Both
+// outcomes advance the group's sequential dispatch: continue-on-fail
+// (decision 2026-08-02) — a failed correctness gate still lets the scale
+// scenarios produce their metrics, and correctness scores 0 via
+// pass-1-only aggregation.
+func terminalRunStatus(status string) bool {
+	return status == topics.RunStatusCompleted || status == topics.RunStatusFailed
+}
+
+// advanceRunGroup dispatches the group's next scenario after a session ends.
+// Returns false when the status message must NOT be committed (claim or
+// publish failed) so Kafka redelivery retries the whole claim+publish —
+// redelivery-safe because the claim only touches `requested` rows and a
+// failed publish resets its row back to `requested`.
+func (c *BenchmarkStatusConsumer) advanceRunGroup(ctx context.Context, msg topics.BenchmarkStatusUpdated) bool {
+	next, err := c.pg.ClaimNextRunInGroup(ctx, msg.RunGroupID)
+	if err != nil {
+		c.log.Error("claim next run in group failed", "run_group_id", msg.RunGroupID, "error", err)
+		return false
+	}
+	if next == nil {
+		return true // group fully dispatched; RecomputeRunGroupStatus owns the terminal state
+	}
+	if err := c.pub.PublishBenchmarkRequested(ctx, publisher.BenchmarkMeta{
+		SessionID:    next.SessionID,
+		SubmissionID: next.SubmissionID,
+		ContestantID: next.ContestantID,
+		RunGroupID:   next.RunGroupID,
+		ScenarioID:   next.ScenarioID,
+		RequestedAt:  time.Now().UTC(),
+	}); err != nil {
+		c.log.Error("publish next scenario failed; resetting for redelivery",
+			"session_id", next.SessionID, "run_group_id", msg.RunGroupID, "error", err)
+		if rerr := c.pg.UpdateRunStatus(ctx, next.SessionID, topics.RunStatusRequested, ""); rerr != nil {
+			c.log.Error("reset claimed run failed — run may be stuck in queued",
+				"session_id", next.SessionID, "error", rerr)
+		}
+		return false
+	}
+	metrics.Counter("run_group_sequential_dispatches_total", "Next-scenario dispatches by the status consumer.", nil, 1)
+	c.log.Info("dispatched next scenario in group",
+		"run_group_id", msg.RunGroupID, "session_id", next.SessionID, "scenario_id", next.ScenarioID,
+		"after_session", msg.SessionID, "after_status", msg.Status)
+	return true
 }
 
 // Start applies behavior for its receiver performs the package-specific operation described by its name.
@@ -93,6 +151,16 @@ func (c *BenchmarkStatusConsumer) Start(ctx context.Context) {
 		metrics.Counter("run_status_updates_total", "Run status updates applied by submission-api.", metrics.Labels("status", msg.Status), 1)
 
 		if msg.RunGroupID != "" {
+			// Sequential-within-group dispatch BEFORE recompute: a terminal
+			// session hands its order band back, and the group's next
+			// scenario goes out on the same event. Not-committed on failure
+			// so redelivery retries.
+			if terminalRunStatus(msg.Status) {
+				if !c.advanceRunGroup(ctx, msg) {
+					recordConsume(topics.TopicBenchmarkStatusUpdated, "advance_error", metrics.SinceSeconds(start))
+					continue
+				}
+			}
 			if err := c.pg.RecomputeRunGroupStatus(ctx, msg.RunGroupID); err != nil {
 				c.log.Warn("recompute run-group status failed",
 					"run_group_id", msg.RunGroupID,

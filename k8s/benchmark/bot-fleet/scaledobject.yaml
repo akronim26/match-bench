@@ -4,6 +4,28 @@
 # It is part of the IICPC platform configuration and should remain
 # aligned with the deployment and operations guidance in the README.
 # Keep comments at the file header so resource bodies stay declarative.
+#
+# REPLICAS DEPEND ON NODES (recorded 2026-08-03). On EKS,
+# overlays/eks-contest/patch-botworker-arm.yaml gives this Deployment a REQUIRED
+# podAntiAffinity on kubernetes.io/hostname plus a 3-CPU request against ~3.6
+# allocatable on a c7g.xlarge — i.e. strictly one worker per botworker node. So
+# every replica KEDA asks for needs its own node, and `minReplicaCount: 2` is
+# unschedulable below 2 botworker nodes. Node supply is the cluster autoscaler's
+# job (botworker_max_size in tfvars); this object is kept rather than deleted, on
+# the basis that the autoscaler provides them.
+#
+# e2e/02-bootstrap.sh:53 DELETES this ScaledObject instead, which is why that
+# harness never met the coupling. Do not copy that workaround.
+#
+# Separately and NOT fixed here: the trigger below scales on consumer lag of
+# workload.assignments, but bot-fleet-controller's pre-scale gate refuses to
+# PUBLISH to that topic until members == shards. No publish -> no lag -> no
+# scale-up -> the gate times out, so any session needing more shards than the
+# current replica count fails at cold start. The design that resolves this
+# (prometheus trigger on iicpc_controller_demanded_workers, which the controller
+# emits at admission, BEFORE the gate waits) is applied only by
+# deploy-local/b5-autoscale-shards.sh and was never committed here. See
+# docs/remaining-work.md.
 
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject

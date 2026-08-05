@@ -7,14 +7,16 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use iicpc_schemas_rust::{OrderAckedBatch, OrderSentBatch, TOPIC_ORDERS_ACKED, TOPIC_ORDERS_SENT};
+use iicpc_schemas_rust::{
+    OrderAckedBatch, OrderSentBatchV2, TOPIC_ORDERS_ACKED, TOPIC_ORDERS_SENT,
+};
 use rdkafka::message::Message;
 use tokio::time;
 use tracing::{info, warn};
 
 use std::time::Instant;
 
-use crate::aggregate::Aggregator;
+use crate::aggregate::{Aggregator, SentEventRef};
 use crate::config::Config;
 use crate::kafka::build_consumer;
 use crate::metrics;
@@ -75,11 +77,29 @@ pub async fn run(cfg: Config) -> Result<()> {
 /// It keeps validation, side effects, and returned values within this module's contract.
 fn ingest(agg: &mut Aggregator, topic: &str, payload: &[u8]) {
     match topic {
-        TOPIC_ORDERS_SENT => match rmp_serde::from_slice::<OrderSentBatch>(payload) {
+        // Positional msgpack with session_id/submission_id/worker_id hoisted into the
+        // batch envelope (see OrderSentBatchV2 in schemas/rust) — must mirror
+        // bot-fleet's telemetry.rs encode side exactly (rmp_serde::to_vec, not
+        // to_vec_named).
+        TOPIC_ORDERS_SENT => match rmp_serde::from_slice::<OrderSentBatchV2>(payload) {
             Ok(b) => {
-                metrics::events_consumed(TOPIC_ORDERS_SENT, b.events.len() as u64);
-                for e in &b.events {
-                    agg.observe_sent(e);
+                let count = b.events.len() as u64;
+                metrics::events_consumed(TOPIC_ORDERS_SENT, count);
+                // Iterate the batch's per-event fields borrowing the hoisted
+                // envelope (session_id) instead of b.into_events(), which cloned
+                // session_id/submission_id/worker_id Strings for every event just
+                // to reconstitute full OrderSentEvents — observe_sent only ever
+                // read session_id and the per-event fields.
+                for f in &b.events {
+                    agg.observe_sent(SentEventRef {
+                        session_id: &b.session_id,
+                        order_id: &f.order_id,
+                        target_send_ts_ns: f.target_send_ts_ns,
+                        send_ts_ns: f.send_ts_ns,
+                        recv_done_ts_ns: f.recv_done_ts_ns,
+                        timed_out: f.timed_out,
+                        barrier_epoch_ns: f.barrier_epoch_ns,
+                    });
                 }
             }
             Err(e) => {

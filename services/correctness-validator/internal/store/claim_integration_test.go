@@ -139,13 +139,17 @@ func TestIntegration_SaveScoredOverwritesTimeout(t *testing.T) {
 	if ev.ContestantID != "team-status" || ev.TotalFills != 4 || ev.ValidFills != 3 {
 		t.Errorf("LoadScore after overwrite = %+v, want team-status 4/3", ev)
 	}
-	var nviol int
+	// The overwrite must carry the per-category counters too, not just the totals:
+	// they are the whole breakdown now that the per-violation table is gone, so a
+	// scored row that replaces a timed_out one while leaving stale category counts
+	// behind would render a breakdown belonging to a different attempt.
+	var overfillsAfter int64
 	if err := st.pool.QueryRow(ctx,
-		"SELECT count(*) FROM correctness_violations WHERE session_id=$1", sid).Scan(&nviol); err != nil {
-		t.Fatalf("count violations: %v", err)
+		"SELECT overfills FROM correctness_summary WHERE session_id=$1", sid).Scan(&overfillsAfter); err != nil {
+		t.Fatalf("read category counters after overwrite: %v", err)
 	}
-	if nviol != 1 {
-		t.Errorf("violation rows after overwrite = %d, want 1", nviol)
+	if overfillsAfter != int64(scored.Report.Overfills) {
+		t.Errorf("overfills after overwrite = %d, want %d", overfillsAfter, scored.Report.Overfills)
 	}
 
 	if claimed, err := st.Save(ctx, scored); err != nil || claimed {

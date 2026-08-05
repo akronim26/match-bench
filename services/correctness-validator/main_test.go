@@ -62,3 +62,20 @@ func TestTimeoutRecordShape(t *testing.T) {
 		t.Errorf("CorrectnessScore() = %v, want 1.0 for the 0/0 placeholder", got)
 	}
 }
+
+// TestInstanceGroupIsPerPod pins the band-learning consumer's group id to the
+// pod identity. The band consumer must NOT share a consumer group across
+// replicas: a shared group splits workload.assignments partitions between
+// pods, so each replica learns only a subset of sessions' bands — and a
+// replica validating a session whose band it never saw falls back to
+// MaxRate=false, silently grading a pass-1 correctness session in invariants
+// mode. Unique group per pod = every replica reads the whole topic.
+func TestInstanceGroupIsPerPod(t *testing.T) {
+	if got := instanceGroup("correctness-validator-band", "validator-7f9c"); got != "correctness-validator-band-validator-7f9c" {
+		t.Errorf("instanceGroup with pod name = %q", got)
+	}
+	// No pod identity (local dev, tests): base group unchanged.
+	if got := instanceGroup("correctness-validator-band", ""); got != "correctness-validator-band" {
+		t.Errorf("instanceGroup without pod name = %q", got)
+	}
+}

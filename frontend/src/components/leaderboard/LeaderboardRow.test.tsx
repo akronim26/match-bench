@@ -38,4 +38,30 @@ describe("LeaderboardRow", () => {
     expect(screen.getByText("9,001")).toBeInTheDocument();
     expect(container.querySelector("tr")?.className).toContain("own");
   });
+
+  it("renders an em-dash when jitter_p99_us is absent", () => {
+    render(
+      <table>
+        <tbody>
+          <LeaderboardRow entry={entry} isOwnRow={false} flash={false} />
+        </tbody>
+      </table>,
+    );
+    expect(screen.getByText("—")).toBeInTheDocument();
+  });
+
+  it("renders the formatted jitter value when present", () => {
+    render(
+      <table>
+        <tbody>
+          <LeaderboardRow
+            entry={{ ...entry, jitter_p99_us: 88.25 }}
+            isOwnRow={false}
+            flash={false}
+          />
+        </tbody>
+      </table>,
+    );
+    expect(screen.getByText("88.3 us")).toBeInTheDocument();
+  });
 });

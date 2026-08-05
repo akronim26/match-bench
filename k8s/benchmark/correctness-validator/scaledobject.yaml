@@ -1,0 +1,46 @@
+# k8s/benchmark/correctness-validator/scaledobject.yaml
+#
+# KEDA scaling for the correctness-validator: replicas 1..4 on consumer-group
+# lag of benchmark.status.updated. Each completed session is one message; a
+# validation takes minutes (full-replay at 1.8M orders), so lag accumulates
+# whenever sessions complete faster than one pod validates — exactly the
+# signal to add pods. minReplicaCount stays 1 (no cold start: validation
+# latency directly delays score publication). maxReplicaCount 4 matches both
+# the exclusive-band concurrent-run ceiling and the topic's partition count —
+# a 5th pod's status consumer would hold no partition assignment and idle.
+# Scale-in mid-validation is safe: the status message is committed only after
+# validation completes, so a killed pod's session is redelivered to a
+# surviving one (the validator's existing recovery path).
+#
+# SIZING CONSTRAINT (2026-08-03): the validator's memory limit is now 8Gi (see
+# deployment.yaml — measured 5.2 GiB peak per session). maxReplicaCount 4 x 8Gi
+# = 32Gi of limit against a 29.9Gi-allocatable m6i.2xlarge general node, so all
+# four replicas can only coexist because requests stay at 2Gi. They will not all
+# fit if they simultaneously validate large sessions. Raising maxReplicaCount,
+# or raising requests toward the limit, needs the general pool resized first.
+#
+# This interacts badly with the OOM poison loop it was hiding: a validator that
+# OOMs never commits its offset, so lag GROWS, so KEDA scales OUT, so every new
+# replica picks up the same oversized session and OOMs too. Scaling out is the
+# wrong response to that failure and multiplies it. Keep max low until the
+# per-scenario peak book depth is known.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: correctness-validator
+  namespace: benchmark
+spec:
+  scaleTargetRef:
+    name: correctness-validator
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  pollingInterval: 15
+  cooldownPeriod: 300
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka.data.svc.cluster.local:9092
+        consumerGroup: correctness-validator
+        topic: benchmark.status.updated
+        lagThreshold: "1"
+        offsetResetPolicy: earliest

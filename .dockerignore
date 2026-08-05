@@ -1,0 +1,43 @@
+# Docker build context exclusions (repo root is the build context for every
+# service Dockerfile except frontend/, which has its own .dockerignore).
+#
+# Without this, `docker build .` ships the 14 GB cargo `target/` tree to the
+# daemon on every build. Every Dockerfile COPYs only the specific subdirs it
+# needs (schemas/, libs/, services/<one>), so excluding broadly is safe.
+
+# build outputs
+target/
+**/target/
+node_modules/
+**/node_modules/
+frontend/.next/
+frontend/out/
+
+# vcs + tooling
+.git/
+.github/
+.claude/
+graphify-out/
+
+# local artifacts, none of which any image needs
+deploy-local/*.zip
+deploy-local/*.tar
+deploy-local/plots/
+deploy-local/correct-engine/
+deploy-local/cpp-matching-engine/
+deploy-local/drain-sink/
+deploy-local/passing-engine/
+deploy-local/passing-engine-epoll/
+deploy-local/throughput-engine/
+deploy-bench/*.tsv
+deploy-bench/*.png
+terraform.tfstate
+**/.terraform/
+
+# docs / diagrams
+docs/
+wiki/
+roadmap/
+*.md
+*.svg
+*.excalidraw*

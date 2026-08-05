@@ -20,11 +20,16 @@ const heartbeatInterval = 15 * time.Second
 
 type SnapshotFunc func(context.Context) (any, error)
 
+type sseMessage struct {
+	event string
+	data  []byte
+}
+
 // Broker groups the state and dependencies used by this package.
 // Keep this type aligned with the runtime contract around it.
 type Broker struct {
 	mu        sync.Mutex
-	clients   map[chan []byte]struct{}
+	clients   map[chan sseMessage]struct{}
 	snapshot  SnapshotFunc
 	heartbeat time.Duration
 }
@@ -32,7 +37,7 @@ type Broker struct {
 // New performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
 func New(snapshot SnapshotFunc) *Broker {
-	return &Broker{clients: make(map[chan []byte]struct{}), snapshot: snapshot, heartbeat: heartbeatInterval}
+	return &Broker{clients: make(map[chan sseMessage]struct{}), snapshot: snapshot, heartbeat: heartbeatInterval}
 }
 
 // Broadcast applies behavior for its receiver performs the package-specific operation described by its name.
@@ -42,11 +47,24 @@ func (b *Broker) Broadcast(ev topics.LeaderboardUpdateEvent) {
 	if err != nil {
 		return
 	}
+	b.send(sseMessage{event: "update", data: payload})
+}
+
+// BroadcastLive marshals payload to JSON and sends it to all connected clients as a "live_metrics" event.
+func (b *Broker) BroadcastLive(payload any) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	b.send(sseMessage{event: "live_metrics", data: data})
+}
+
+func (b *Broker) send(msg sseMessage) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for ch := range b.clients {
 		select {
-		case ch <- payload:
+		case ch <- msg:
 		default:
 			close(ch)
 			delete(b.clients, ch)
@@ -68,7 +86,7 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	ch := make(chan []byte, 16)
+	ch := make(chan sseMessage, 16)
 	b.mu.Lock()
 	b.clients[ch] = struct{}{}
 	metrics.Gauge("leaderboard_api_sse_clients", "Connected leaderboard SSE clients.", nil, float64(len(b.clients)))
@@ -103,13 +121,13 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			flusher.Flush()
-		case payload, ok := <-ch:
+		case msg, ok := <-ch:
 			if !ok {
 				return
 			}
-			w.Write([]byte("event: update\n"))
+			w.Write([]byte("event: " + msg.event + "\n"))
 			w.Write([]byte("data: "))
-			w.Write(payload)
+			w.Write(msg.data)
 			w.Write([]byte("\n\n"))
 			flusher.Flush()
 		}

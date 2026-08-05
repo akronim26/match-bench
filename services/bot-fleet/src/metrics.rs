@@ -28,8 +28,28 @@ use prometheus_client::{
 // tell that survives even if Prometheus scraping (15s) is too coarse or the
 // port-forward dies. Separate from the write_seconds histogram, which is cumulative.
 static MAX_WRITE_BLOCK_NS: AtomicU64 = AtomicU64::new(0);
+// Same read-and-reset pattern for the pacing-fidelity signals the task-count
+// sweep keys on: worst coalesced batch and worst schedule slip since last snapshot,
+// plus write count so the logger can derive orders-per-write.
+static MAX_BATCH_SIZE: AtomicU64 = AtomicU64::new(0);
+static MAX_SLIP_NS: AtomicU64 = AtomicU64::new(0);
+static WRITES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 type ResultFamily = Family<[(&'static str, &'static str); 1], Counter>;
+type ProtocolFamily = Family<[(&'static str, &'static str); 1], Counter>;
+type ProtocolHistogramFamily =
+    Family<[(&'static str, &'static str); 1], Histogram, fn() -> Histogram>;
+
+/// protocol_label maps a wire protocol to its metric label ("fix"|"rest"|"ws"), the
+/// mandatory QoL-3 dimension: with mixed-protocol runs, a stall can't be attributed
+/// to a transport without this on orders_sent / order_write_error / write / slip.
+pub fn protocol_label(protocol: iicpc_schemas_rust::Protocol) -> &'static str {
+    match protocol {
+        iicpc_schemas_rust::Protocol::Fix => "fix",
+        iicpc_schemas_rust::Protocol::Rest => "rest",
+        iicpc_schemas_rust::Protocol::Ws => "ws",
+    }
+}
 
 /// Metrics stores the state passed across this module boundary.
 /// Keep field changes compatible with callers and serialized contracts.
@@ -39,23 +59,37 @@ struct Metrics {
     tasks_assigned: Counter,
     tasks_connected: Counter,
     connect_failures: Counter,
-    orders_sent: Counter,
-    order_write_errors: Counter,
+    orders_sent: ProtocolFamily,
+    // orders_sent_total mirrors the sum of `orders_sent` across protocols, kept as a
+    // plain Counter so the 1s snapshot logger (worker.rs) can read it lock-free
+    // without summing a Family on every tick.
+    orders_sent_total: Counter,
+    order_write_errors: ProtocolFamily,
+    order_write_errors_total: Counter,
     // inflight: orders sent-but-unacked across all FIX tasks (sum of every task's
     // pending map). The direct contestant-drain readout: if the contestant stops
     // acking, this climbs to BOT_MAX_INFLIGHT_PER_TASK * tasks and the writers
     // throttle. Distinguishes "contestant not draining" (inflight pinned high)
     // from "eBPF not decoding" (inflight normal, sends continue).
     inflight: Gauge,
+    // workloads_in_flight: how many workload specs this worker is executing right
+    // now (0..=MAX_CONCURRENT_WORKLOADS). Pinned at the cap means the pod is the
+    // constraint and the fleet needs another replica; sitting at 1 while sessions
+    // queue elsewhere means shards are landing unevenly across pods.
+    workloads_in_flight: Gauge,
     telemetry_dropped: Counter,
     telemetry_batches: Counter,
     telemetry_events_flushed: Counter,
+    // stale_workloads: workload specs skipped because published_at_unix_ns was
+    // older than WORKLOAD_SPEC_MAX_AGE_S — leftovers from a session whose
+    // controller-side partition lease was already released and reused.
+    stale_workloads: Counter,
     // write_seconds: wall time spent inside write_all per order. This is the direct
     // backpressure probe — if the drain stops reading, its TCP window closes and this
     // grows. schedule_slip_seconds: send_ts - target_send_ts, i.e. how far behind the
     // paced schedule each order actually went out (CPU OR backpressure lateness).
-    write_seconds: Histogram,
-    schedule_slip_seconds: Histogram,
+    write_seconds: ProtocolHistogramFamily,
+    schedule_slip_seconds: ProtocolHistogramFamily,
     // write_batch_size: number of orders coalesced into each write_all. With batching
     // off (BOT_WRITE_BATCH=1) this is always 1; under load it shows how effectively
     // catch-up batching amortises the per-write syscall.
@@ -88,14 +122,20 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let tasks_assigned = Counter::default();
     let tasks_connected = Counter::default();
     let connect_failures = Counter::default();
-    let orders_sent = Counter::default();
-    let order_write_errors = Counter::default();
+    let orders_sent = ProtocolFamily::default();
+    let orders_sent_total = Counter::default();
+    let order_write_errors = ProtocolFamily::default();
+    let order_write_errors_total = Counter::default();
     let inflight = Gauge::default();
+    let workloads_in_flight = Gauge::default();
     let telemetry_dropped = Counter::default();
     let telemetry_batches = Counter::default();
     let telemetry_events_flushed = Counter::default();
-    let write_seconds = Histogram::new(send_buckets());
-    let schedule_slip_seconds = Histogram::new(send_buckets());
+    let stale_workloads = Counter::default();
+    let write_seconds: ProtocolHistogramFamily =
+        Family::new_with_constructor(|| Histogram::new(send_buckets()));
+    let schedule_slip_seconds: ProtocolHistogramFamily =
+        Family::new_with_constructor(|| Histogram::new(send_buckets()));
     let write_batch_size = Histogram::new(batch_buckets());
 
     registry.register(
@@ -120,18 +160,23 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     );
     registry.register(
         "iicpc_bot_orders_sent",
-        "Bot orders sent to workload targets.",
+        "Bot orders sent to workload targets, by protocol.",
         orders_sent.clone(),
     );
     registry.register(
         "iicpc_bot_order_write_errors",
-        "Bot order websocket write errors.",
+        "Bot order write errors, by protocol.",
         order_write_errors.clone(),
     );
     registry.register(
         "iicpc_bot_inflight",
         "Orders sent-but-unacked across all FIX tasks (contestant-drain backpressure).",
         inflight.clone(),
+    );
+    registry.register(
+        "iicpc_bot_workloads_in_flight",
+        "Workload specs this worker is executing concurrently.",
+        workloads_in_flight.clone(),
     );
     registry.register(
         "iicpc_bot_telemetry_events_dropped",
@@ -147,6 +192,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         "iicpc_bot_telemetry_events_flushed",
         "Bot telemetry events flushed.",
         telemetry_events_flushed.clone(),
+    );
+    registry.register(
+        "iicpc_bot_stale_workloads",
+        "Workload specs skipped for being older than WORKLOAD_SPEC_MAX_AGE_S.",
+        stale_workloads.clone(),
     );
     registry.register(
         "iicpc_bot_write_seconds",
@@ -171,11 +221,15 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         tasks_connected,
         connect_failures,
         orders_sent,
+        orders_sent_total,
         order_write_errors,
+        order_write_errors_total,
         inflight,
+        workloads_in_flight,
         telemetry_dropped,
         telemetry_batches,
         telemetry_events_flushed,
+        stale_workloads,
         write_seconds,
         schedule_slip_seconds,
         write_batch_size,
@@ -218,6 +272,13 @@ pub fn workload_error() {
         .inc();
 }
 
+/// workloads_in_flight sets the count of workload specs executing concurrently on
+/// this worker. Set (not inc/dec) so the gauge cannot drift out of step with the
+/// authoritative InFlight set the worker loop keeps.
+pub fn workloads_in_flight(n: usize) {
+    METRICS.workloads_in_flight.set(n as i64);
+}
+
 /// tasks_assigned performs the module-specific operation described by its name.
 /// It keeps validation, side effects, and returned values within this module's contract.
 pub fn tasks_assigned(n: usize) {
@@ -236,21 +297,36 @@ pub fn connect_failure() {
     METRICS.connect_failures.inc();
 }
 
-/// order_sent performs the module-specific operation described by its name.
-/// It keeps validation, side effects, and returned values within this module's contract.
-pub fn order_sent() {
-    METRICS.orders_sent.inc();
+/// stale_workload_skipped records a workload spec skipped for staleness.
+pub fn stale_workload_skipped() {
+    METRICS.stale_workloads.inc();
 }
 
-/// orders_sent_by records a whole batch of `n` orders sent in one write.
-pub fn orders_sent_by(n: usize) {
-    METRICS.orders_sent.inc_by(n as u64);
+/// order_sent records one order sent over `protocol` ("fix"|"rest"|"ws").
+pub fn order_sent(protocol: &'static str) {
+    METRICS
+        .orders_sent
+        .get_or_create(&[("protocol", protocol)])
+        .inc();
+    METRICS.orders_sent_total.inc();
 }
 
-/// order_write_error performs the module-specific operation described by its name.
-/// It keeps validation, side effects, and returned values within this module's contract.
-pub fn order_write_error() {
-    METRICS.order_write_errors.inc();
+/// orders_sent_by records a whole batch of `n` orders sent over `protocol` in one write.
+pub fn orders_sent_by(protocol: &'static str, n: usize) {
+    METRICS
+        .orders_sent
+        .get_or_create(&[("protocol", protocol)])
+        .inc_by(n as u64);
+    METRICS.orders_sent_total.inc_by(n as u64);
+}
+
+/// order_write_error records one failed write on `protocol`.
+pub fn order_write_error(protocol: &'static str) {
+    METRICS
+        .order_write_errors
+        .get_or_create(&[("protocol", protocol)])
+        .inc();
+    METRICS.order_write_errors_total.inc();
 }
 
 /// telemetry_dropped performs the module-specific operation described by its name.
@@ -273,21 +349,37 @@ pub fn telemetry_flushed(events: usize) {
     METRICS.telemetry_events_flushed.inc_by(events as u64);
 }
 
-/// observe_write records one write_all: its wall duration (ns) and how many orders
-/// were coalesced into it. write_ns isolates drain backpressure; batch_size shows how
-/// effectively catch-up batching amortises the per-write syscall.
-pub fn observe_write(write_ns: u64, batch_size: usize) {
-    METRICS.write_seconds.observe(write_ns as f64 / 1e9);
+/// observe_write records one write_all on `protocol`: its wall duration (ns) and how
+/// many orders were coalesced into it. write_ns isolates drain backpressure;
+/// batch_size shows how effectively catch-up batching amortises the per-write syscall.
+pub fn observe_write(protocol: &'static str, write_ns: u64, batch_size: usize) {
+    METRICS
+        .write_seconds
+        .get_or_create(&[("protocol", protocol)])
+        .observe(write_ns as f64 / 1e9);
     METRICS.write_batch_size.observe(batch_size as f64);
     MAX_WRITE_BLOCK_NS.fetch_max(write_ns, Ordering::Relaxed);
+    MAX_BATCH_SIZE.fetch_max(batch_size as u64, Ordering::Relaxed);
+    WRITES_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
-/// observe_slip records one order's lateness vs its paced schedule (ns).
-pub fn observe_slip(slip_ns: u64) {
-    METRICS.schedule_slip_seconds.observe(slip_ns as f64 / 1e9);
+/// observe_slip records one order's lateness vs its paced schedule (ns) on `protocol`.
+pub fn observe_slip(protocol: &'static str, slip_ns: u64) {
+    METRICS
+        .schedule_slip_seconds
+        .get_or_create(&[("protocol", protocol)])
+        .observe(slip_ns as f64 / 1e9);
+    MAX_SLIP_NS.fetch_max(slip_ns, Ordering::Relaxed);
 }
 
 /// inflight_add increments the global sent-but-unacked gauge by `n` (one write batch).
+
+/// Serializes every test (across this crate's test binary) that snapshots and
+/// asserts the process-global inflight gauge — parallel interleaving of those
+/// tests was a recurring flake. Test-only.
+#[cfg(test)]
+pub(crate) static INFLIGHT_GAUGE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn inflight_add(n: usize) {
     METRICS.inflight.inc_by(n as i64);
 }
@@ -300,7 +392,7 @@ pub fn inflight_sub(n: usize) {
 /// Snapshot accessors for the 1s debug logger (worker.rs). Reading these is cheap
 /// and lock-free; the logger derives per-second rates from successive samples.
 pub fn orders_sent_value() -> u64 {
-    METRICS.orders_sent.get()
+    METRICS.orders_sent_total.get()
 }
 
 /// inflight_value returns the current sent-but-unacked depth across all tasks.
@@ -310,13 +402,30 @@ pub fn inflight_value() -> i64 {
 
 /// write_errors_value returns the cumulative count of failed order writes.
 pub fn write_errors_value() -> u64 {
-    METRICS.order_write_errors.get()
+    METRICS.order_write_errors_total.get()
 }
 
 /// take_max_write_block_ns returns the worst write_all block seen since the last
 /// call and resets the tracker to zero (read-and-reset for per-second reporting).
 pub fn take_max_write_block_ns() -> u64 {
     MAX_WRITE_BLOCK_NS.swap(0, Ordering::Relaxed)
+}
+
+/// take_max_batch_size returns the largest coalesced write batch since the last
+/// call (read-and-reset). 1 = every order got its own write (distinct t1).
+pub fn take_max_batch_size() -> u64 {
+    MAX_BATCH_SIZE.swap(0, Ordering::Relaxed)
+}
+
+/// take_max_slip_ns returns the worst schedule slip since the last call
+/// (read-and-reset).
+pub fn take_max_slip_ns() -> u64 {
+    MAX_SLIP_NS.swap(0, Ordering::Relaxed)
+}
+
+/// writes_value returns the cumulative count of write_all calls across protocols.
+pub fn writes_value() -> u64 {
+    WRITES_TOTAL.load(Ordering::Relaxed)
 }
 
 /// render performs the module-specific operation described by its name.
@@ -364,6 +473,7 @@ mod tests {
 
     #[test]
     fn inflight_gauge_round_trips() {
+        let _g = INFLIGHT_GAUGE_TEST_LOCK.lock().unwrap();
         let start = inflight_value();
         inflight_add(64);
         inflight_add(64);
@@ -376,11 +486,34 @@ mod tests {
     fn max_write_block_reads_and_resets() {
         // swap out any residue first so this test owns the tracker.
         take_max_write_block_ns();
-        observe_write(5_000_000, 1);
-        observe_write(20_000_000, 1);
-        observe_write(3_000_000, 1);
+        observe_write("fix", 5_000_000, 1);
+        observe_write("fix", 20_000_000, 1);
+        observe_write("fix", 3_000_000, 1);
         // take returns the worst seen, then resets to zero.
         assert_eq!(take_max_write_block_ns(), 20_000_000);
         assert_eq!(take_max_write_block_ns(), 0);
+    }
+
+    #[test]
+    fn protocol_label_maps_each_wire_protocol() {
+        use iicpc_schemas_rust::Protocol;
+        assert_eq!(protocol_label(Protocol::Fix), "fix");
+        assert_eq!(protocol_label(Protocol::Rest), "rest");
+        assert_eq!(protocol_label(Protocol::Ws), "ws");
+    }
+
+    #[test]
+    fn orders_sent_by_protocol_updates_both_the_family_and_the_total() {
+        let start = orders_sent_value();
+        order_sent("fix");
+        orders_sent_by("rest", 4);
+        assert_eq!(orders_sent_value(), start + 5);
+    }
+
+    #[test]
+    fn order_write_error_by_protocol_updates_both_the_family_and_the_total() {
+        let start = write_errors_value();
+        order_write_error("ws");
+        assert_eq!(write_errors_value(), start + 1);
     }
 }

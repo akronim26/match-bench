@@ -27,6 +27,7 @@ const headers = [
   ["team_name", "TEAM"],
   ["peak_sustained_tps", "PEAK TPS"],
   ["total_correctness", "CORRECT"],
+  ["jitter_p99_us", "JITTER P99"],
   ["rank_delta", "Δ"],
   ["status", "STATUS"],
 ] as const;
@@ -51,6 +52,7 @@ export function LeaderboardTable({
           <col />
           <col className={styles.tpsCol} />
           <col className={styles.correctCol} />
+          <col className={styles.jitterCol} />
           <col className={styles.deltaCol} />
           <col className={styles.statusCol} />
         </colgroup>
@@ -75,10 +77,10 @@ export function LeaderboardTable({
         </thead>
         <tbody>
           {loading ? (
-            <SkeletonRows columns={6} />
+            <SkeletonRows columns={7} />
           ) : rows.length === 0 ? (
             <tr>
-              <td colSpan={6} className={styles.emptyCell}>
+              <td colSpan={7} className={styles.emptyCell}>
                 No ranked results for this scenario yet.
               </td>
             </tr>

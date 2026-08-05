@@ -6,6 +6,10 @@ name = "matching-engine"
 version = "0.1.0"
 edition = "2021"
 
+# Standalone: this crate builds inside the contestant sandbox (network-restricted,
+# vendored deps), not as part of the platform's cargo workspace.
+[workspace]
+
 [[bin]]
 name = "matching_engine"
 path = "src/main.rs"

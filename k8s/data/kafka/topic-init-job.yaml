@@ -28,6 +28,16 @@ spec:
           args:
             - |
               broker="kafka-0.kafka.data.svc.cluster.local:9092"
+              # RF and min.insync default to 1: that is what a single-broker cluster can
+              # satisfy, and this deployment runs one broker. They were hardcoded to 3 and
+              # 2, which no single-broker cluster can ever meet -- and because
+              # min.insync.replicas=2 on RF=1 makes EVERY produce fail with
+              # NOT_ENOUGH_REPLICAS, creating a topic that way is worse than not creating
+              # it. Override both for a real multi-broker cluster. Keep in step with
+              # ensure_topics() in services/bot-fleet/src/kafka.rs, which reads the same
+              # values from KAFKA_TOPIC_REPLICATION_FACTOR / KAFKA_MIN_INSYNC_REPLICAS.
+              rf="${KAFKA_TOPIC_REPLICATION_FACTOR:-1}"
+              insync="${KAFKA_MIN_INSYNC_REPLICAS:-1}"
               failed=0
               create_topic() {
                 topic="$1"
@@ -39,8 +49,8 @@ spec:
                   --if-not-exists \
                   --topic "$topic" \
                   --partitions "$partitions" \
-                  --replication-factor 3 \
-                  --config min.insync.replicas=2 \
+                  --replication-factor "$rf" \
+                  --config min.insync.replicas="$insync" \
                   --config retention.ms="$retention_ms" \
                   --config max.message.bytes=1048576
               }
@@ -48,7 +58,12 @@ spec:
               create_topic submission.build.requested 3 604800000 || failed=1
               create_topic submission.status.updated 3 604800000 || failed=1
               create_topic benchmark.requested 3 604800000 || failed=1
-              create_topic benchmark.status.updated 3 604800000 || failed=1
+              # 4, not 3: partitions here bound VALIDATION parallelism (one
+              # status partition per active validator group member), and the
+              # true concurrent-run ceiling is 4 exclusive order bands
+              # (24 partitions / width 6). Keep this >= the band count or the
+              # last completing session's validation queues by construction.
+              create_topic benchmark.status.updated 4 604800000 || failed=1
               create_topic workload.assignments 24 86400000 || failed=1
               create_topic barrier 3 86400000 || failed=1
               create_topic bot.ready 3 86400000 || failed=1

@@ -11,7 +11,7 @@ metadata:
   name: bot-fleet-worker
   namespace: benchmark
 spec:
-  replicas: 5
+  replicas: 2
   selector:
     matchLabels:
       app: bot-fleet-worker
@@ -34,26 +34,13 @@ spec:
         - key: botworker
           operator: Exists
           effect: NoSchedule
-      # EKS nodes default to jumbo MTU (9001) with offloads on. The eBPF latency
-      # capture (CAPTURE_CAP=1536B) then truncates the load gen's frames, corrupting
-      # FIX framing so requests never match responses (~98% of latency samples lost).
-      # Clamp the load gen's eth0 to 1500 + disable segmentation offload so it emits
-      # <=1500B wire frames. (Receiver side: the sandbox nodes run the gro-disable
-      # DaemonSet so cross-node GRO doesn't re-coalesce them before capture.)
-      initContainers:
-        - name: net-tune
-          image: nicolaka/netshoot:latest
-          command:
-            - sh
-            - -c
-            - |
-              ip link set dev eth0 mtu 1500
-              ethtool -K eth0 gso off tso off gro off lro off
-              echo "net-tune: $(ip -o link show eth0 | grep -o 'mtu [0-9]*'), offloads off"
-          securityContext:
-            privileged: true
-            runAsUser: 0
-            runAsNonRoot: false
+      # The net-tune initContainer (MTU 1500 clamp + offloads off, privileged)
+      # is GONE: CAPTURE_CAP is 9029 since 2026-08-01, so a full jumbo frame
+      # (EKS default MTU 9001) fits one capture record and the load generator
+      # no longer has to pay the ~6x packet-count tax to keep the capture
+      # complete. Receiver side is unchanged and still required: the sandbox
+      # nodes run the gro-disable DaemonSet, because GRO re-coalesces frames
+      # up to 64KB regardless of MTU. See docs/capture-ringbuf-drops.md §6.2.
       containers:
         - name: bot-fleet-worker
           image: ghcr.io/agrawalx/bot-fleet:demo
@@ -88,6 +75,18 @@ spec:
             # BLOCKS at 1 GiB rather than growing.
             - name: BOT_MAX_INFLIGHT_PER_TASK
               value: "10000"
+            # How many workload specs one worker executes CONCURRENTLY. Before this
+            # existed the consume loop awaited each workload inline, so a pod ran one
+            # shard at a time and two concurrent sessions landing on the same pod were
+            # serialized regardless of how small their shards were.
+            #
+            # Sizing is bound by the same worst case as the memory limit above:
+            #   MAX_CONCURRENT_WORKLOADS x (tasks x inflight x ~350 B) <= mem limit
+            # At the EKS shard size (1000 tasks x 10k inflight ~= 3.5 GiB) only 2 fit
+            # under the 6Gi limit. Raise only alongside the limit, or when shards are
+            # known to be small (the local scenarios are ~200 tasks).
+            - name: MAX_CONCURRENT_WORKLOADS
+              value: "2"
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false

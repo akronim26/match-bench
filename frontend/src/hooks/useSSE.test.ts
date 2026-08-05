@@ -74,6 +74,21 @@ describe("useSSE", () => {
         updated_at_ns: 1717,
       },
     },
+    {
+      name: "live_metrics carries the LiveMetricsEvent payload",
+      event: "live_metrics" as const,
+      payload: {
+        contestant_id: "c-1",
+        session_id: "sess-1",
+        wave_index: 3,
+        p50_ns: 100_000,
+        p99_ns: 900_000,
+        p999_ns: 1_500_000,
+        tps_1s: 12345.6,
+        error_rate: 0.01,
+        updated_at_ns: 9999,
+      },
+    },
   ])("dispatches named events: $name", ({ event, payload }) => {
     const onMessage = vi.fn();
     renderHook(() => useSSE("/api/leaderboard/v1/events", { onMessage }));

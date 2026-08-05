@@ -54,10 +54,36 @@ spec:
                   key: database-url
             - name: KAFKA_STATUS_GROUP
               value: correctness-validator
+            # Downward-API pod identity: suffixes the band-learning consumer's
+            # group so every replica reads ALL of workload.assignments (a
+            # shared group would split it and replicas would miss bands ->
+            # silent wrong-mode validation). Required for replicas > 1.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: SETTLE_DELAY_MS
               value: "10000"
+            # 300s (added 2026-08-03). The Go default is 60s (main.go:58) and was
+            # never declared here, so every harness overrode it imperatively
+            # (deploy-bench/eks-up.sh:64, deploy-local/up-dev.sh:253) while a
+            # plain `apply -k` deployment silently ran at 60s.
+            #
+            # 60s is far under what a real session needs. A 3.8M-order pass-1
+            # validation measured on EKS peaked at 5.2 GiB and ran for minutes;
+            # the full-replay path rebuilds the reference book order by order.
+            # Timing out mid-validation abandons work that was going to succeed
+            # AND leaves the session's Kafka offset uncommitted, so the next pod
+            # re-reads it — the same shape as the OOM poison loop above.
+            - name: VALIDATION_TIMEOUT_MS
+              value: "300000"
+            # 1 (was 4): parallelism now comes from KEDA-scaled replicas
+            # (scaledobject.yaml, 1..4), one validation per pod, so a pod's
+            # requests/limits bound exactly one full-replay validation. In a
+            # single process, >1 was capped at 3 by the status topic's
+            # partition count anyway.
             - name: VALIDATOR_CONCURRENCY
-              value: "4"
+              value: "1"
           livenessProbe:
             httpGet:
               path: /healthz
@@ -78,11 +104,37 @@ spec:
               drop:
                 - ALL
           resources:
+            # 2 CPU Guaranteed (2026-08-02, was 250m/1CPU Burstable): one
+            # full-replay validation per pod (VALIDATOR_CONCURRENCY=1) — a
+            # 1-CPU limit CFS-throttles the replay, the exact failure class
+            # the capture had.
+            #
+            # memory 2Gi -> 8Gi (2026-08-03, MEASURED on EKS). 2Gi OOMKilled
+            # every validator pod on real session sizes, and because the OOM
+            # happens before the Kafka offset is committed the pod restarts and
+            # re-reads the SAME session — a poison loop that never drains and
+            # that KEDA makes worse by scaling to max, so every replica loops.
+            # Observed peak for one 3.8M-order pass-1 session: 5.2 GiB.
+            #
+            # Where it goes: the reorder buffer holds up to 2*REORDER_WINDOW
+            # (2*1<<20 = 2,097,152) assembled orders before releasing anything
+            # — measured at 283 B/order = ~594 MB, FIXED. The rest scales with
+            # the number of orders RESTING in the reference book (v.pending /
+            # v.ref), which the hft profile grows for the whole run. Eviction is
+            # NOT missing: filled/cancelled/never-resting orders are finalized
+            # and deleted as they leave the book (DrainEvicted -> finalize), and
+            # book.Forget exists solely to bound the streaming path. Resting
+            # orders cannot be evicted — a later order may still match them.
+            #
+            # So memory is O(peak book depth), NOT O(session), and 8Gi is sized
+            # against the measured 5.2 GiB peak plus headroom. It is a ceiling,
+            # not a bound: a longer scenario rests more orders and needs more.
+            # Re-measure peak per scenario once contest scenarios are fixed.
             requests:
-              cpu: 250m
-              memory: 256Mi
+              cpu: "2"
+              memory: 2Gi
             limits:
-              cpu: "1"
-              memory: 1Gi
+              cpu: "2"
+              memory: 8Gi
       securityContext:
         runAsNonRoot: true

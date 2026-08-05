@@ -41,3 +41,9 @@ services/auth-api/auth-api
 wget-log
 infra/terraform/.terraform/
 deploy-local/images.tar
+/graphify-out 
+# terraform-v2 local backend config + state artifacts
+infra/terraform-v2/backend.hcl
+infra/terraform-v2/.terraform/
+infra/terraform-v2/*.tfstate*
+infra/terraform-v2/*.tfplan

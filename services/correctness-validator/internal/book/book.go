@@ -6,8 +6,6 @@
 package book
 
 import (
-	"math"
-
 	"github.com/google/btree"
 	"github.com/iicpc/correctness-validator/internal/model"
 )
@@ -28,6 +26,15 @@ type Trade struct {
 	Price        int64
 	Qty          uint64
 	MakerSeq     uint64
+	// Self-match-prevention identity of both sides, carried here so scoring keys on
+	// what was actually on the wire. Identity used to be re-derived by parsing the TASK
+	// id out of the order id — and pass 1 runs exactly one task, so every order looked
+	// like the same participant, every trade looked like a self-trade, and not one of
+	// 1.35M fills was ever accepted. That parser is deleted.
+	MakerSMPID    uint32
+	MakerHasSMPID bool
+	TakerSMPID    uint32
+	TakerHasSMPID bool
 }
 
 // RestingState groups the state and dependencies used by this package.
@@ -38,6 +45,10 @@ type RestingState struct {
 	Price     int64
 	Seq       uint64
 	Remaining uint64
+	// SMP identity, so scoring can tell whether a contestant's reported fill matched
+	// an order sharing its self-match-prevention id.
+	SMPID    uint32
+	HasSMPID bool
 }
 
 // restingOrder groups the state and dependencies used by this package.
@@ -48,17 +59,10 @@ type restingOrder struct {
 	price     int64
 	remaining uint64
 	seq       uint64 // arrival rank (FIFO/time priority within a level)
-	availIdx  int    // index into Engine.avail for this resting order's window
-}
-
-// Availability groups the state and dependencies used by this package.
-// Keep this type aligned with the runtime contract around it.
-type Availability struct {
-	Side        model.Side
-	Price       int64
-	Participant string
-	EnterT3     uint64
-	ExitT3      uint64
+	// smpID is the resting order's self-match-prevention id, valid only when hasSMP.
+	// An aggressor carrying the same id skips this order (see matchAndRest).
+	smpID  uint32
+	hasSMP bool
 }
 
 // priceLevel groups the state and dependencies used by this package.
@@ -79,11 +83,9 @@ type Engine struct {
 	trades     []Trade
 	repriced   map[string]bool
 	seqByOrder map[string]uint64
-	avail      []Availability
 	// evicted accumulates the order IDs removed from the book during the current
 	// Process call (maker fully consumed, cancel, replace-remove). The streaming
-	// validator drains it after each Process to finalize departed orders. The batch
-	// path never drains it (small: ids only) and is being retired.
+	// validator drains it after each Process to finalize departed orders.
 	evicted []string
 }
 
@@ -155,6 +157,27 @@ func (e *Engine) IsResting(orderID string) bool {
 	return ok
 }
 
+// RestingSMPMatch reports whether an order carrying `smpID` is currently resting on
+// `side` at `price`.
+//
+// This is how a contestant self-match is detected, and the resting state is the ONLY
+// evidence available: the engine applies skip-and-continue, so for a genuine self-match
+// it produces no trade at all and there is nothing in Trades()/DrainTrades() to compare
+// against. Scanning one price level keeps this O(level) — Resting() would copy the whole
+// book on every fill.
+func (e *Engine) RestingSMPMatch(side model.Side, price int64, smpID uint32) bool {
+	level, ok := e.tree(side).Get(&priceLevel{price: price})
+	if !ok {
+		return false
+	}
+	for _, ro := range level.orders {
+		if ro.hasSMP && ro.smpID == smpID {
+			return true
+		}
+	}
+	return false
+}
+
 // Resting applies behavior for its receiver performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
 func (e *Engine) Resting() map[string]RestingState {
@@ -162,6 +185,7 @@ func (e *Engine) Resting() map[string]RestingState {
 	for id, ro := range e.index {
 		out[id] = RestingState{
 			OrderID: id, Side: ro.side, Price: ro.price, Seq: ro.seq, Remaining: ro.remaining,
+			SMPID: ro.smpID, HasSMPID: ro.hasSMP,
 		}
 	}
 	return out
@@ -185,7 +209,7 @@ func (e *Engine) Process(o *model.Order) {
 	case model.NewMarket:
 		e.matchAndRest(o, false)
 	case model.Cancel:
-		e.remove(o.OrigOrderID, o.EffectiveT3)
+		e.remove(o.OrigOrderID)
 	case model.Replace:
 		e.replace(o)
 	}
@@ -197,6 +221,9 @@ func (e *Engine) matchAndRest(o *model.Order, rest bool) {
 	remaining := o.Qty
 	opp := oppositeSide(o.Side)
 	oppTree := e.tree(opp)
+	// Levels temporarily removed because every maker in them shares the aggressor's
+	// SMP id; restored before this call returns (see the loop's tail).
+	var skippedLevels []*priceLevel
 
 	for remaining > 0 {
 		level, ok := oppTree.Min()
@@ -206,19 +233,36 @@ func (e *Engine) matchAndRest(o *model.Order, rest bool) {
 		if o.Kind == model.NewLimit && !crosses(o.Side, o.Price, level.price) {
 			break
 		}
+		// skipped holds makers passed over by self-match prevention. They are NOT
+		// cancelled — skip-and-continue leaves them resting — but they must come out
+		// of the front of the FIFO so the loop can reach the next maker, then go back
+		// in their original order once this aggressor is done.
+		var skipped []*restingOrder
 		for len(level.orders) > 0 && remaining > 0 {
 			maker := level.orders[0]
+			// Self-match prevention: an aggressor never matches a resting order
+			// carrying the same SMP id. SMPIDNone is unconstrained on either side, so
+			// two id-less orders (all of pass-2's traffic) match exactly as before.
+			if o.HasSMPID && maker.hasSMP && maker.smpID == o.SMPID {
+				skipped = append(skipped, maker)
+				level.orders = level.orders[1:]
+				continue
+			}
 			traded := min(remaining, maker.remaining)
 			e.fills = append(e.fills,
 				Fill{OrderID: o.OrderID, Price: level.price, Qty: traded},
 				Fill{OrderID: maker.orderID, Price: level.price, Qty: traded},
 			)
 			e.trades = append(e.trades, Trade{
-				MakerOrderID: maker.orderID,
-				TakerOrderID: o.OrderID,
-				Price:        level.price,
-				Qty:          traded,
-				MakerSeq:     maker.seq,
+				MakerOrderID:  maker.orderID,
+				TakerOrderID:  o.OrderID,
+				Price:         level.price,
+				Qty:           traded,
+				MakerSeq:      maker.seq,
+				MakerSMPID:    maker.smpID,
+				MakerHasSMPID: maker.hasSMP,
+				TakerSMPID:    o.SMPID,
+				TakerHasSMPID: o.HasSMPID,
 			})
 			maker.remaining -= traded
 			remaining -= traded
@@ -226,12 +270,36 @@ func (e *Engine) matchAndRest(o *model.Order, rest bool) {
 				level.orders = level.orders[1:]
 				delete(e.index, maker.orderID)
 				e.evicted = append(e.evicted, maker.orderID)
-				e.closeAvail(maker, o.EffectiveT3) // maker fully consumed at the aggressor's t3
 			}
+		}
+		// Put skipped makers back at the FRONT: they arrived before anything still in
+		// the level, so restoring them elsewhere would silently reorder time priority
+		// and show up as a FIFO violation against a correct engine.
+		if len(skipped) > 0 {
+			level.orders = append(skipped, level.orders...)
 		}
 		if len(level.orders) == 0 {
 			oppTree.Delete(level)
+			continue
 		}
+		if o.HasSMPID && allSameSMP(level.orders, o.SMPID) {
+			// Every remaining maker at this level shares the aggressor's id, so this
+			// level can yield nothing more. The aggressor must still CONTINUE to the
+			// next price level — that is the "continue" in skip-and-continue — so the
+			// level is parked out of the tree for this call and restored afterwards
+			// rather than breaking out of the match loop entirely.
+			skippedLevels = append(skippedLevels, level)
+			oppTree.Delete(level)
+			continue
+		}
+		// Level still has matchable makers but the aggressor stopped (filled, or a
+		// limit price that no longer crosses): nothing further to do here.
+		break
+	}
+	// Restore levels parked by self-match prevention. They were never cancelled — the
+	// orders in them are still live and must be visible to the NEXT aggressor.
+	for _, lv := range skippedLevels {
+		oppTree.ReplaceOrInsert(lv)
 	}
 
 	if rest && remaining > 0 && o.Kind == model.NewLimit {
@@ -239,16 +307,23 @@ func (e *Engine) matchAndRest(o *model.Order, rest bool) {
 	}
 }
 
+// allSameSMP reports whether every order in the level shares `smp`. Used to break out
+// of a price level the aggressor can make no further progress against, so a fully
+// self-crossing book terminates instead of spinning.
+func allSameSMP(orders []*restingOrder, smp uint32) bool {
+	for _, o := range orders {
+		if !o.hasSMP || o.smpID != smp {
+			return false
+		}
+	}
+	return len(orders) > 0
+}
+
 // insert applies behavior for its receiver performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
 func (e *Engine) insert(o *model.Order, remaining uint64) {
 	e.seq++
-	ro := &restingOrder{orderID: o.OrderID, side: o.Side, price: o.Price, remaining: remaining, seq: e.seq}
-	ro.availIdx = len(e.avail)
-	e.avail = append(e.avail, Availability{
-		Side: o.Side, Price: o.Price, Participant: model.ParticipantOf(o.OrderID),
-		EnterT3: o.EffectiveT3, ExitT3: math.MaxUint64,
-	})
+	ro := &restingOrder{orderID: o.OrderID, side: o.Side, price: o.Price, remaining: remaining, seq: e.seq, smpID: o.SMPID, hasSMP: o.HasSMPID}
 	e.index[o.OrderID] = ro
 	e.seqByOrder[o.OrderID] = e.seq
 	tree := e.tree(o.Side)
@@ -261,26 +336,13 @@ func (e *Engine) insert(o *model.Order, remaining uint64) {
 	}
 }
 
-// closeAvail applies behavior for its receiver performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func (e *Engine) closeAvail(ro *restingOrder, exitT3 uint64) {
-	if ro.availIdx >= 0 && ro.availIdx < len(e.avail) && e.avail[ro.availIdx].ExitT3 == math.MaxUint64 {
-		e.avail[ro.availIdx].ExitT3 = exitT3
-	}
-}
-
-// Availability applies behavior for its receiver performs the package-specific operation described by its name.
-// It keeps validation, side effects, and returned values within this package's contract.
-func (e *Engine) Availability() []Availability { return e.avail }
-
 // remove applies behavior for its receiver performs the package-specific operation described by its name.
 // It keeps validation, side effects, and returned values within this package's contract.
-func (e *Engine) remove(orderID string, exitT3 uint64) {
+func (e *Engine) remove(orderID string) {
 	ro, ok := e.index[orderID]
 	if !ok {
 		return
 	}
-	e.closeAvail(ro, exitT3)
 	tree := e.tree(ro.side)
 	if level, ok := tree.Get(&priceLevel{price: ro.price}); ok {
 		for i, x := range level.orders {
@@ -321,8 +383,18 @@ func (e *Engine) replace(o *model.Order) {
 	if o.Price != ro.price {
 		e.repriced[orReplaceID(o)] = true
 	}
-	e.remove(o.OrigOrderID, o.EffectiveT3)
-	e.insert(&model.Order{OrderID: orReplaceID(o), Side: o.Side, Price: o.Price}, o.Qty)
+	// The re-inserted order inherits the ORIGINAL resting order's SMP identity. A
+	// replace does not change who owns the order, and rebuilding it without the id
+	// would silently exempt every repriced order from self-match prevention: the
+	// reference would then match it against a same-id aggressor that a compliant
+	// contestant correctly skipped, and score the contestant for a missed fill.
+	// Taking it from `ro` rather than from `o` also means this holds whether or not
+	// the wire carries the id on the replace message itself.
+	smpID, hasSMP := ro.smpID, ro.hasSMP
+	e.remove(o.OrigOrderID)
+	repl := &model.Order{OrderID: orReplaceID(o), Side: o.Side, Price: o.Price}
+	repl.SMPID, repl.HasSMPID = smpID, hasSMP
+	e.insert(repl, o.Qty)
 }
 
 // orReplaceID performs the package-specific operation described by its name.

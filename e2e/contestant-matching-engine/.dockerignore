@@ -1,0 +1,5 @@
+# This crate's build context is its own directory, so the repo-root .dockerignore
+# does not apply here. Without this, `docker build` ships the 154 MB local `target/`
+# tree to the daemon on every build.
+target/
+.dockerignore

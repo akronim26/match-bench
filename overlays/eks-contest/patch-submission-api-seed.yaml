@@ -1,0 +1,90 @@
+# Contest scenario seed. The decided run-group shape (2026-08-01) is ONE
+# `correctness` run plus ONE `ramp` run: correctness supplies the full-replay
+# score that decides grading, ramp supplies latency/TPS and the pass-2 telemetry
+# the frontend charts. Seeded as exactly those two for the first EKS end-to-end
+# bring-up (2026-08-03) — `StartBenchmark` fans out over EVERY scenario row, so
+# each extra row is another full session per upload, and `spike`/`constant` are
+# 204-task sessions that add cluster time without answering anything the first
+# run is asking.
+#
+# Contest-day tradeoff to revisit: dropping `spike` removes the only source of
+# `SpikeRecoveryNS` (`score.go` matches `Scenario == "spike"`). Restore the
+# 4-scenario seed — "correctness,ramp,spike,constant" — once the platform is
+# proven end to end, or accept that the metric goes away.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: submission-api
+  namespace: platform
+spec:
+  template:
+    spec:
+      containers:
+        - name: submission-api
+          env:
+            - name: SEED_SCENARIOS
+              value: "correctness,constant"
+            # constant = 100 HFT tasks x 1000 rps = 100k for 60s.
+            #
+            # `ramp` is deliberately NOT seeded: at 4599 tasks it needs
+            # ceil(4599/1000) = 5 shards, and with one bot-fleet-worker per
+            # botworker node (required podAntiAffinity, 3 CPU of ~3.6
+            # allocatable) that means 5 nodes. The controller's pre-scale gate
+            # waits 90s for 5 consumer-group members and fails the session --
+            # and it cannot resolve itself, because the committed ScaledObject
+            # scales on lag of workload.assignments while the gate refuses to
+            # PUBLISH to that topic until the members exist. See
+            # docs/remaining-work.md. Restore ramp once that is fixed.
+            #
+            # Task count is what decides shards, and the bot MIX decides task
+            # count: at 100% HFT and rpsPerHFT=1000, 100k rps is exactly 100
+            # tasks -> 1 shard -> fits the current 2 workers with room. The
+            # default 60/25/15 mix would instead spend most of the budget on
+            # 5-rps retail bots and produce ~5100 tasks for the same 100k.
+            # 25,600 -> exactly 25 HFT tasks. NOT 25,000: the 98% HFT split is
+            # applied before the integer division by rpsPerHFT=1000, so 25,000
+            # gives (25000*98/100)/1000 = 24. 25,600 gives 25,088/1000 = 25.
+            # Chosen to probe the reference book BELOW its measured ~85k
+            # ceiling, where latency should reflect real service time rather
+            # than the standing queue that dominates at 100k.
+            - name: CONSTANT_TOTAL_RPS
+              value: "25600"
+            - name: CONSTANT_DURATION_S
+              value: "60"
+            # 98/1/1, NOT 100/0/0. envUint32 (builder.go:410) treats a parsed
+            # ZERO as "unset" and silently substitutes the default, so
+            # MIX_RETAIL_PCT=0 became 25 and MIX_INSTITUTIONAL_PCT=0 became 15
+            # -- the mix then summed to 140, validation rejected it, and
+            # submission-api CrashLooped on every start with "population mix
+            # must sum to 100, got 140". Zero is a legitimate value for a
+            # percentage; the env helper cannot express it. Every value here
+            # must therefore be >= 1.
+            #
+            # Task arithmetic at 100k, which is what decides shard count:
+            #   hft    (100000 * 98/100) / 1000 =  98 tasks
+            #   retail (100000 *  1/100) /    5 = 200 tasks
+            #   inst   (100000 *  1/100) /  300 =   3 tasks
+            #                                    -----------
+            #                                     301 tasks -> 1 shard
+            # Realised load 99,900 rps, of which 98,000 is HFT. The 200 retail
+            # bots contribute 1,000 rps but are 2/3 of the task count -- which
+            # is exactly why the default 60/25/15 mix would have produced ~5,100
+            # tasks and six shards for the same 100k.
+            - name: MIX_HFT_PCT
+              value: "98"
+            - name: MIX_RETAIL_PCT
+              value: "1"
+            - name: MIX_INSTITUTIONAL_PCT
+              value: "1"
+            # Required even though `spike` is not seeded: Config validation runs
+            # over the WHOLE config and rejects SpikePeakRPS < ConstantTotalRPS
+            # (builder.go:141), so leaving the 50000 default would fail seeding
+            # outright and the scenarios table would come up empty.
+            - name: SPIKE_PEAK_RPS
+              value: "100000"
+            - name: RESEED_SCENARIOS
+              value: "true"
+            # false during the validation phase: the b-suite submits zips
+            # unauthenticated. Contest-day (different account) flips true.
+            - name: AUTH_REQUIRED
+              value: "false"
